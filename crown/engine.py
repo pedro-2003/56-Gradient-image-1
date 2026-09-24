@@ -437,7 +437,11 @@ class Trainer:
             item = self.train_items[i]
             sigma = sigma_of(band)
             noise = torch.randn(item["scaled"].shape, generator=gen, dtype=torch.float32).to(self.device)
-            prompt = item["caption"] if (self.summary["steps"] % 2 == 0) else ""   # 50/50, like the score
+            frac = float(getattr(cfg, "empty_prompt_frac", 0.5))
+            if frac == 0.5:
+                prompt = item["caption"] if (self.summary["steps"] % 2 == 0) else ""   # 50/50, like the score
+            else:
+                prompt = "" if self.rng.random() < frac else item["caption"]
             ts = time.time()
             with torch.enable_grad():
                 noisy, target = make_noisy(item["scaled"], noise, sigma)
