@@ -100,6 +100,7 @@ class Assets:
         self.family = family
         self.model_dir = model_dir
         self.baked_dir = baked_dir or os.environ.get("CROWN_ASSETS", str(C.BAKED_DIR))
+        self.train_base = "cache"          # or "evaluator": ideogram4 trains on the evaluator's own base file
         self._ckpt = None
 
     def _full_checkpoint(self):
@@ -113,6 +114,12 @@ class Assets:
     def diffusion_sd(self):
         f = self.family
         if f == "ideogram4":
+            if getattr(self, "train_base", "cache") == "evaluator":
+                # the per-tensor comfy_quant file the evaluator merges into (baked for the twin)
+                path = os.path.join(self.baked_dir, C.BAKED_IDEOGRAM4_BASE)
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"--train-base evaluator: {path} not baked")
+                return dequantize_scaled_fp8(load_file(path))
             tdir = os.path.join(self.model_dir, "transformer")
             shards = _shards(tdir) if os.path.isdir(tdir) else _root_safetensors(self.model_dir)[:1]
             return dequantize_scaled_fp8(load_sharded(shards))
