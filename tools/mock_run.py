@@ -113,6 +113,8 @@ def main():
     ap.add_argument("--seconds", type=float, default=60)
     ap.add_argument("--out", default=os.path.join(tempfile.gettempdir(), "crown-mock"))
     ap.add_argument("--n-images", type=int, default=12)
+    ap.add_argument("--max-members", type=int, default=2)
+    ap.add_argument("--polish", action="store_true")
     a = ap.parse_args()
     torch.manual_seed(0)
     Cc, H, W = 4, 8, 8
@@ -133,7 +135,8 @@ def main():
     cfg = types.SimpleNamespace(
         family="mock", seed=0, include=None, exclude=None, rank=4, alpha=4.0, ckpt=False, ckpt_stride=1,
         lr=3e-3, lr_final_frac=0.1, warmup_steps=5, weight_decay=0.0, grad_clip=1.0, lora_plus_ratio=1.0, ema=0.99,
-        eval_share=0.25, confirm_top=3, confirm_noises=4, phase2=True, max_members=2)
+        eval_share=0.25, confirm_top=3, confirm_noises=4, phase2=True, max_members=a.max_members,
+        polish=a.polish, polish_lr_frac=0.3, band_power=0.0)
     budget = Budget(time.time() + a.seconds, kill_margin_s=0.0, publish_reserve_s=2.0)
     os.makedirs(a.out, exist_ok=True)
     os.environ["GOD_TRAIN_LOGS"] = "1"

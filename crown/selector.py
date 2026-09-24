@@ -78,13 +78,20 @@ class Selector:
 
     # --- plateau -------------------------------------------------------------------
     def plateaued(self, window: int = 3, member=None) -> bool:
-        """True when the last `window` screens (of `member`, if given) each failed
-        to beat the running best by more than the paired SE of that comparison."""
+        """True when the last `window` eval POINTS (a point = all candidates screened at one step of
+        one member) each failed to beat the running best of the earlier points by more than the
+        paired SE of that comparison. Counting points, not candidates, keeps raw/ema pairs from
+        making a two-point window look like three."""
         screened = [c for c in self.cands if c.screen is not None and (member is None or c.member == member)]
-        if len(screened) < window + 1:
+        points = {}
+        for c in screened:
+            key = (c.member, c.step)
+            if key not in points or c.screen.score < points[key].screen.score:
+                points[key] = c
+        ordered = [points[k] for k in sorted(points)]
+        if len(ordered) < window + 1:
             return False
-        recent = screened[-window:]
-        earlier = screened[:-window]
+        recent, earlier = ordered[-window:], ordered[:-window]
         b = min(earlier, key=lambda c: c.screen.score)
         for c in recent:
             mean, se, n = c.screen.paired_diff(b.screen)

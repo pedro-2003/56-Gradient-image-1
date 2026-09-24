@@ -54,6 +54,13 @@ def parse(argv=None):
                    help="score the confirm stage through the evaluator twin on ideogram4/qwen-image")
     p.add_argument("--no-twin", dest="twin", action="store_false")
     p.add_argument("--identity-only", action="store_true", help="load, export the identity LoRA, exit (fallback path)")
+    p.add_argument("--polish", action="store_true",
+                   help="when a member plateaus and a second member cannot fit, restart from its best state with a low decaying LR "
+                        "for the time left instead of training on past the optimum")
+    p.add_argument("--polish-lr-frac", type=float, default=0.3, help="polish peak LR as a fraction of --lr")
+    p.add_argument("--band-power", type=float, default=0.0,
+                   help="0 = uniform over sigma bands (like the score); p>0 repeats band b (loss_b/median)^p times per pass, "
+                        "loss_b being the latest holdout per-band loss - importance sampling toward where the score mass is")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args(argv)
 

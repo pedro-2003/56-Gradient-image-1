@@ -224,6 +224,8 @@ class Trainer:
         t0 = time.time()
         rep = self.scorer.score(guider, extra, lambda p, it: self._set_cond(guider, p, it), noises=noises)
         dt = time.time() - t0
+        if noises == 1:
+            self.band_loss = self._per_band(rep)   # latest screened candidate's per-band loss (for --band-power)
         self.lora.restore()
         if noises == 1:
             self.budget.observe_eval(dt)
@@ -382,6 +384,7 @@ class Trainer:
         step, last_eval, cases, raw_hist = 0, 0, [], []
         m_best = self.best
         plateau_exit = False
+        peak, warm_base, polishing, tag_prefix = cfg.lr, 0, False, ""
         while True:
             now = time.time()
             due = (step - last_eval) >= self._eval_every()
@@ -390,21 +393,39 @@ class Trainer:
                 break
             # phase-2 exit: this member's screens have plateaued and another member could
             # reach a comparable optimum (time-to-best of this member, plus its evals) in the time left
-            if (cfg.phase2 and member + 1 < cfg.max_members and self.selector.plateaued(member=member)):
+            want_phase2 = cfg.phase2 and member + 1 < cfg.max_members
+            want_polish = getattr(cfg, "polish", False) and not polishing
+            plateau = (want_phase2 or want_polish) and self.selector.plateaued(member=member)
+            if plateau and want_phase2:
                 need_next = max(1, m_best.step) * budget.est_step() + 3 * budget.est_eval() + budget.est_eval(cfg.confirm_noises) * cfg.confirm_top
                 if budget.fits(need_next):
                     plateau_exit = True
                     log(f"m{member} plateau at step {step} (best {m_best.tag}@{m_best.step}); handing {budget.remaining():.0f}s to the next member")
                     break
+            if plateau and want_polish:
+                if (m_best.step > 0 and m_best.member == member
+                        and horizon_end - now > 3 * budget.est_eval() + 60):
+                    # anneal from the best state with a low, decaying LR for the time left, instead of
+                    # training on past the optimum (the champion's telemetry shows 50-90% of budget lost there)
+                    lora.load_state({n: (u.to(self.device), d.to(self.device)) for n, (u, d) in m_best.state.items()})
+                    peak = cfg.lr * cfg.polish_lr_frac
+                    opt = torch.optim.AdamW(groups, lr=peak, betas=(0.9, 0.99), weight_decay=cfg.weight_decay, eps=1e-8)
+                    if ema is not None:
+                        ema = [q.detach().clone() for q in lora.params]
+                    t_start, warm_base, polishing, tag_prefix = now, step, True, "pol-"
+                    raw_hist.clear()
+                    self.summary["polish"] = {"from": f"{m_best.tag}@{m_best.step}", "at_step": step, "peak_lr": peak, "seconds": horizon_end - now}
+                    log(f"m{member} plateau at step {step}: polishing from {m_best.tag}@{m_best.step} at lr {peak:.1e} for {horizon_end - now:.0f}s")
             p = min(1.0, (now - t_start) / max(1.0, horizon_end - t_start))
-            warm = min(1.0, (step + 1) / max(1, cfg.warmup_steps))
-            lr = cfg.lr * warm * (cfg.lr_final_frac + (1 - cfg.lr_final_frac) * 0.5 * (1 + math.cos(math.pi * p)))
+            warm = min(1.0, (step - warm_base + 1) / max(1, cfg.warmup_steps))
+            lr = peak * warm * (cfg.lr_final_frac + (1 - cfg.lr_final_frac) * 0.5 * (1 + math.cos(math.pi * p)))
             for g in opt.param_groups:
                 g["lr"] = lr * g["lr_mult"]
 
             # case cycle: every (image, band) pair once per pass, shuffled; uniform over bands like the score
             if not cases:
-                cases = [(i, b) for i in range(len(self.train_items)) for b in range(C.EVAL_STRATA)]
+                reps = self._band_repeats()
+                cases = [(i, b) for i in range(len(self.train_items)) for b in range(C.EVAL_STRATA) for _ in range(reps[b])]
                 self.rng.shuffle(cases)
             i, band = cases.pop()
             item = self.train_items[i]
@@ -431,26 +452,41 @@ class Trainer:
                 log(f"m{member} step {step} loss {loss.item():.4f} band {band} lr {lr:.2e} step {budget.est_step():.2f}s left {horizon_end - time.time():.0f}s")
             if due:
                 last_eval = step
-                m_best = self._screen_candidates(guider, extra, member, step, ema, raw_hist, m_best)
+                m_best = self._screen_candidates(guider, extra, member, step, ema, raw_hist, m_best, tag_prefix=tag_prefix)
         # member end: a final screen (if the last eval point is stale) plus the average of the
         # last two raw states — one extra candidate that costs one screen per member, not per point
         if step > last_eval and not plateau_exit and budget.fits(budget.est_eval() * (self._screens_per_point() + 0.2)):
-            m_best = self._screen_candidates(guider, extra, member, step, ema, raw_hist, m_best)
+            m_best = self._screen_candidates(guider, extra, member, step, ema, raw_hist, m_best, tag_prefix=tag_prefix)
         if len(raw_hist) >= 2 and budget.fits(budget.est_eval() * 1.2):
-            m_best = self._screen_candidates(guider, extra, member, step, None, raw_hist, m_best, avg_only=True)
+            m_best = self._screen_candidates(guider, extra, member, step, None, raw_hist, m_best, avg_only=True, tag_prefix=tag_prefix)
         log(f"member {member} done: steps={step} best={m_best.tag}@{m_best.step} {m_best.score:.6f} plateau_exit={plateau_exit}")
         return m_best, plateau_exit
 
-    def _screen_candidates(self, guider, extra, member, step, ema, raw_hist, m_best, avg_only=False):
+    def _band_repeats(self):
+        """How many times each sigma band appears per case-cycle pass: 1 (uniform) unless --band-power
+        is set, then (loss_b / median loss)^p rounded, from the latest holdout per-band loss."""
+        n = C.EVAL_STRATA
+        bl = getattr(self, "band_loss", None)
+        power = float(getattr(self.cfg, "band_power", 0.0) or 0.0)
+        if power <= 0 or not bl or len(bl) != n:
+            return [1] * n
+        med = float(np.median(bl)) or 1.0
+        reps = [max(1, int(round((float(v) / med) ** power))) for v in bl]
+        if self.summary.get("band_repeats") != reps:
+            self.summary["band_repeats"] = reps
+            log(f"band repeats (power {power}): {reps}")
+        return reps
+
+    def _screen_candidates(self, guider, extra, member, step, ema, raw_hist, m_best, avg_only=False, tag_prefix=""):
         lora = self.lora
         cands = []
         if avg_only:
-            cands.append(Candidate("avg2", step, soup_state(raw_hist[-2:]), lora.scale, member=member))
+            cands.append(Candidate(tag_prefix + "avg2", step, soup_state(raw_hist[-2:]), lora.scale, member=member))
         else:
             raw_state = {n: (u.detach().cpu().clone(), d.detach().cpu().clone()) for n, (u, d) in lora.state().items()}
-            cands.append(Candidate("raw", step, raw_state, lora.scale, member=member))
+            cands.append(Candidate(tag_prefix + "raw", step, raw_state, lora.scale, member=member))
             if ema is not None:
-                cands.append(Candidate("ema", step, {n: (t[0].cpu(), t[1].cpu()) for n, t in lora.state_from_flat([e.clone() for e in ema]).items()}, lora.scale, member=member))
+                cands.append(Candidate(tag_prefix + "ema", step, {n: (t[0].cpu(), t[1].cpu()) for n, t in lora.state_from_flat([e.clone() for e in ema]).items()}, lora.scale, member=member))
             raw_hist.append(raw_state)
         for c in cands:
             c.state = {n: (u.to(self.device), d.to(self.device)) for n, (u, d) in c.state.items()}

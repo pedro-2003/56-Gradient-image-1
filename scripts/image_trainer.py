@@ -8,6 +8,7 @@ loadable LoRA behind.
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -49,6 +50,7 @@ def resolve_model_dir(model):
 def run_trainer(args, family, model_dir, dataset, work, deadline, extra):
     cmd = [sys.executable, "/app/crown/train.py", "--family", family, "--model-dir", model_dir, "--dataset", dataset,
            "--out", work, "--deadline-ts", str(deadline)] + RECIPES[family] + COMMON + extra
+    cmd += shlex.split(os.environ.get("CROWN_EXTRA_ARGS", ""))   # local experiments only; unset on the validator
     if args.trigger_word:
         cmd += ["--trigger-word", args.trigger_word]
     if logs_enabled():
