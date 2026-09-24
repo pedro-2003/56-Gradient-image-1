@@ -284,6 +284,9 @@ class Trainer:
 
     def _eval_every(self):
         """Steps between eval points so that screening takes ~cfg.eval_share of wall-clock."""
+        fixed = int(getattr(self.cfg, "eval_every", 0) or 0)
+        if fixed > 0:
+            return fixed
         share = self.cfg.eval_share
         cost = self.budget.est_eval() * self._screens_per_point()
         return max(50, int(math.ceil(cost * (1 - share) / (share * self.budget.est_step()))))
@@ -295,6 +298,8 @@ class Trainer:
             it["scaled"] = it["scaled"].to(self.device)
         self.scorer = HoldoutScorer(self.holdout_items, None, self.device)
         self.selector = Selector()
+        import crown.selector as _sel
+        _sel.SEL_METRIC = getattr(cfg, "select_metric", "mean") or "mean"
 
         # base: identity LoRA (up == 0). Saved before any training so an artifact always exists.
         ident = Candidate("identity", 0, self.lora.state(), self.lora.scale)

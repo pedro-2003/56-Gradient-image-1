@@ -21,6 +21,8 @@ own per-case losses, and the small integers (top-k, window) are counts.
 from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
+
 from .scoring import ScoreReport
 
 
@@ -36,7 +38,23 @@ class Candidate:
 
     @property
     def score(self):
-        return self.confirm.score if self.confirm is not None else (self.screen.score if self.screen else float("inf"))
+        rep = self.confirm if self.confirm is not None else self.screen
+        return sel_score(rep) if rep is not None else float("inf")
+
+
+SEL_METRIC = "mean"
+
+
+def sel_score(rep) -> float:
+    """The number the selector ranks by: the evaluator's mean, or a robust reduction of the
+    per-image losses (p75 / worst) that prefers candidates without a bad image."""
+    if SEL_METRIC == "mean" or len(rep.per_image) == 1:
+        return float(rep.score)
+    if SEL_METRIC == "p75":
+        return float(np.quantile(rep.per_image, 0.75))
+    if SEL_METRIC == "worst":
+        return float(max(rep.per_image))
+    raise ValueError(f"unknown select metric {SEL_METRIC!r}")
 
 
 class Selector:
@@ -47,7 +65,7 @@ class Selector:
     def add(self, cand: Candidate):
         self.cands.append(cand)
         if cand.screen is not None:
-            self.history.append((cand.step, cand.screen.score))
+            self.history.append((cand.step, sel_score(cand.screen)))
 
     def best(self, confirmed_only=False) -> Optional[Candidate]:
         pool = [c for c in self.cands if (c.confirm if confirmed_only else (c.confirm or c.screen)) is not None]
@@ -55,7 +73,7 @@ class Selector:
 
     def top(self, k: int, member=None):
         pool = [c for c in self.cands if c.screen is not None and (member is None or c.member == member)]
-        return sorted(pool, key=lambda c: c.screen.score)[:k]
+        return sorted(pool, key=lambda c: sel_score(c.screen))[:k]
 
     # --- 1-SE rule ------------------------------------------------------------------
     def pick(self, use_confirm=True) -> Optional[Candidate]:

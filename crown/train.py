@@ -63,6 +63,9 @@ def parse(argv=None):
                    help="screen only the EMA candidate at intermediate eval points (raw at the member end), doubling the eval cadence")
     p.add_argument("--empty-prompt-frac", type=float, default=0.5,
                    help="share of training steps with the empty prompt; 0.5 alternates exactly like the score's 50/50 mix")
+    p.add_argument("--select-metric", default="mean", choices=["mean", "p75", "worst"],
+                   help="how the selector ranks candidates; mean = the evaluator's own reduction")
+    p.add_argument("--eval-every", type=int, default=0, help="fixed eval cadence in steps (0 = derive from --eval-share)")
     p.add_argument("--band-power", type=float, default=0.0,
                    help="0 = uniform over sigma bands (like the score); p>0 repeats band b (loss_b/median)^p times per pass, "
                         "loss_b being the latest holdout per-band loss - importance sampling toward where the score mass is")
