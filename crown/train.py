@@ -67,7 +67,7 @@ def parse(argv=None):
                    help="how the selector ranks candidates; mean = the evaluator's own reduction")
     p.add_argument("--eval-every", type=int, default=0, help="fixed eval cadence in steps (0 = derive from --eval-share)")
     p.add_argument("--holdout-names", default="", help="comma-separated image names to hold out (overrides the stratified choice)")
-    p.add_argument("--train-base", default="cache", choices=["cache", "evaluator"],
+    p.add_argument("--train-base", default="cache", choices=["cache", "evaluator", "requant"],
                    help="ideogram4: train on the cache's per-row fp8 base (dequantised) or on the evaluator's per-tensor file")
     p.add_argument("--band-power", type=float, default=0.0,
                    help="0 = uniform over sigma bands (like the score); p>0 repeats band b (loss_b/median)^p times per pass, "
@@ -110,8 +110,8 @@ def main(argv=None):
 
     assets = Assets(cfg.family, cfg.model_dir, cfg.baked_dir)
     assets.train_base = getattr(cfg, "train_base", "cache")
-    if assets.train_base == "evaluator":
-        engine.log("training base: the evaluator's own ideogram4 file")
+    if assets.train_base != "cache":
+        engine.log(f"training base: {assets.train_base}")
 
     t = time.time()
     kind, payload = assets.vae()

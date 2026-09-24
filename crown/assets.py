@@ -122,7 +122,13 @@ class Assets:
                 return dequantize_scaled_fp8(load_file(path))
             tdir = os.path.join(self.model_dir, "transformer")
             shards = _shards(tdir) if os.path.isdir(tdir) else _root_safetensors(self.model_dir)[:1]
-            return dequantize_scaled_fp8(load_sharded(shards))
+            sd = dequantize_scaled_fp8(load_sharded(shards))
+            if getattr(self, "train_base", "cache") == "requant":
+                # the 0921 champion: snap the dequantised weights to the plain fp8 e4m3 grid (scale 1)
+                # so training sees an fp8-perturbed base rather than the exact one
+                sd = {k: (v.float().to(torch.float8_e4m3fn).float().to(torch.bfloat16) if v.dtype == torch.bfloat16 else v)
+                      for k, v in sd.items()}
+            return sd
         if f == "flux":
             # rayonlabs/FLUX.1-dev: flux1-dev.safetensors is a bare diffusion model (double_blocks.*,
             # single_blocks.*, ...), exactly what the evaluator's UNETLoader reads. If a full
