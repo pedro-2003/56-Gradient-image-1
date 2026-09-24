@@ -28,5 +28,11 @@ ARGS=(--task-id "$TASK_ID" --model "$MODEL" --dataset-zip "/cache/datasets/${TAS
       --model-type "$MODEL_TYPE" --expected-repo-name "local-${TASK_ID:0:8}" --hours-to-complete "$HOURS")
 [ -n "$TRIGGER" ] && ARGS+=(--trigger-word "$TRIGGER")
 export GOD_TRAIN_LOGS=${GOD_TRAIN_LOGS:-1} TRANSFORMERS_CACHE=/cache/hf_cache
+# the validator runs the container with --network none; without docker here, cut the network at the
+# Python level (tools/netblock/sitecustomize.py) so a hidden download dependency fails loudly
+if [ "${NETBLOCK:-1}" != "0" ]; then
+  export PYTHONPATH="$TRAINER/tools/netblock${PYTHONPATH:+:$PYTHONPATH}" NETBLOCK=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  echo "netblock: non-loopback sockets disabled for this run"
+fi
 python /app/scripts/image_trainer.py "${ARGS[@]}"
 echo "artifact: $OUT_DIR/$TASK_ID/local-${TASK_ID:0:8}/"
