@@ -94,8 +94,10 @@ class EvaluatorTwin:
             self.source = "cache (same file as evaluator)"
         else:
             raise ValueError(f"twin not needed for {family}: bf16 hook path == evaluator numerics")
-        self.base = engine.load_diffusion_model(sd, family, meta)
-        del sd
+        # the base is built on demand (score) and released afterwards: it must not occupy the GPU
+        # while the trainer runs (9.3 GB on ideogram4, 20 GB on qwen-image)
+        self._sd, self._meta = sd, meta
+        self.base = None
         self.items = holdout_items
         self.scorer = HoldoutScorer(holdout_items, None, device)
         self._processed = {}
@@ -116,17 +118,42 @@ class EvaluatorTwin:
             self._processed[key] = c
         guider.conds = c
 
-    def score(self, state, scale, noises=1):
-        """ScoreReport for `state` computed the evaluator's way, or None (+reason) if it
-        would not load. Conditioning cache is per patched model, so it is reset each call."""
+    def _load(self):
         from . import engine
 
-        patched, missing = apply_lora_like_evaluator(self.base, state, scale)
-        if missing:
-            return None, missing
+        if self.base is None:
+            self.base = engine.load_diffusion_model(self._sd, self.family, self._meta)
+
+    def release(self):
+        """Drop the twin's model (and any patched clone) from the GPU; the caller reloads the
+        training model afterwards."""
+        import gc
+
+        import comfy.model_management as mm
+
+        self.base = None
         self._processed = {}
-        guider = engine.make_guider(patched, self.raw_conds[""])
-        sampler = _ScoreSampler(self, noises)
-        lat0 = self.items[0]["scaled"].to(self.device)
-        guider.sample(torch.zeros_like(lat0), lat0, sampler, engine.evaluator_schedule(), disable_pbar=True, seed=C.EVAL_SAMPLER_SEED)
-        return sampler.report, []
+        gc.collect()
+        mm.unload_all_models()
+        torch.cuda.empty_cache()
+
+    def score(self, state, scale, noises=1):
+        """ScoreReport for `state` computed the evaluator's way, or None (+reason) if it
+        would not load. The base is loaded for the call and released afterwards; the
+        conditioning cache is per patched model, so it is reset each call."""
+        from . import engine
+
+        try:
+            self._load()
+            patched, missing = apply_lora_like_evaluator(self.base, state, scale)
+            if missing:
+                return None, missing
+            self._processed = {}
+            guider = engine.make_guider(patched, self.raw_conds[""])
+            sampler = _ScoreSampler(self, noises)
+            lat0 = self.items[0]["scaled"].to(self.device)
+            guider.sample(torch.zeros_like(lat0), lat0, sampler, engine.evaluator_schedule(), disable_pbar=True, seed=C.EVAL_SAMPLER_SEED)
+            return sampler.report, []
+        finally:
+            del state
+            self.release()

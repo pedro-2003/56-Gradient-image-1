@@ -171,6 +171,7 @@ class Trainer:
             raise ValueError("LoRA include/exclude selected no Linear layers")
         self.lora = Lora(targets, cfg.rank, cfg.alpha, self.device, cfg.seed)
         self.lora.attach(model)
+        self._ckpt_on = bool(cfg.ckpt)
         if cfg.ckpt:
             log("gradient checkpointing on", enable_checkpointing(model.model.diffusion_model, stride=cfg.ckpt_stride), "blocks")
         log(f"lora targets={len(targets)} params={sum(p.numel() for p in self.lora.params) / 1e6:.1f}M rank={cfg.rank}")
@@ -448,14 +449,29 @@ class Trainer:
             else:
                 prompt = "" if self.rng.random() < frac else item["caption"]
             ts = time.time()
-            with torch.enable_grad():
-                noisy, target = make_noisy(item["scaled"], noise, sigma)
-                den = self._forward(guider, extra, prompt, item, noisy, sigma)
-                loss = flow_prediction_mse(noisy, den, target, sigma).mean()
-                loss.backward()
-            torch.nn.utils.clip_grad_norm_(lora.params, cfg.grad_clip)
-            opt.step()
-            opt.zero_grad(set_to_none=True)
+            try:
+                with torch.enable_grad():
+                    noisy, target = make_noisy(item["scaled"], noise, sigma)
+                    den = self._forward(guider, extra, prompt, item, noisy, sigma)
+                    loss = flow_prediction_mse(noisy, den, target, sigma).mean()
+                    loss.backward()
+                torch.nn.utils.clip_grad_norm_(lora.params, cfg.grad_clip)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+            except torch.OutOfMemoryError:
+                # fail closed: never let one OOM end the run with the identity artifact
+                opt.zero_grad(set_to_none=True)
+                noisy = den = loss = None
+                torch.cuda.empty_cache()
+                self.summary["oom"] = self.summary.get("oom", 0) + 1
+                if not self._ckpt_on:
+                    enable_checkpointing(self.model.model.diffusion_model, stride=1)
+                    self._ckpt_on = True
+                    cases.append((i, band))
+                    log(f"m{member} OOM at step {step}: gradient checkpointing enabled, retrying the step ({self._mem()})")
+                    continue
+                log(f"m{member} OOM again at step {step} with checkpointing on: stopping this member with best-so-far ({self._mem()})")
+                break
             if ema is not None:
                 with torch.no_grad():
                     for e, q in zip(ema, lora.params):
@@ -464,7 +480,7 @@ class Trainer:
             step += 1
             self.summary["steps"] += 1
             if step % 25 == 0:
-                log(f"m{member} step {step} loss {loss.item():.4f} band {band} lr {lr:.2e} step {budget.est_step():.2f}s left {horizon_end - time.time():.0f}s")
+                log(f"m{member} step {step} loss {loss.item():.4f} band {band} lr {lr:.2e} step {budget.est_step():.2f}s left {horizon_end - time.time():.0f}s {self._mem()}")
             if due:
                 last_eval = step
                 m_best = self._screen_candidates(guider, extra, member, step, ema, raw_hist, m_best, tag_prefix=tag_prefix)
@@ -478,6 +494,13 @@ class Trainer:
             m_best = self._screen_candidates(guider, extra, member, step, None, raw_hist, m_best, avg_only=True, tag_prefix=tag_prefix)
         log(f"member {member} done: steps={step} best={m_best.tag}@{m_best.step} {m_best.score:.6f} plateau_exit={plateau_exit}")
         return m_best, plateau_exit
+
+    @staticmethod
+    def _mem():
+        try:
+            return f"gpu {torch.cuda.memory_allocated() / 2**30:.1f}/{torch.cuda.max_memory_allocated() / 2**30:.1f} GB"
+        except Exception:  # noqa: BLE001 - CPU mock
+            return "gpu n/a"
 
     def _confirm_count(self):
         """How many top candidates to confirm: at least --confirm-top, more when time is left over
@@ -521,7 +544,14 @@ class Trainer:
             raw_hist.append(raw_state)
         for c in cands:
             c.state = {n: (u.to(self.device), d.to(self.device)) for n, (u, d) in c.state.items()}
-            self._screen(guider, extra, c)
+            try:
+                self._screen(guider, extra, c)
+            except torch.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                self.summary["oom"] = self.summary.get("oom", 0) + 1
+                log(f"screen OOM at step {step} ({c.tag}): candidate skipped ({self._mem()})")
+                c.state = {n: (u.cpu(), d.cpu()) for n, (u, d) in c.state.items()}
+                continue
             c.state = {n: (u.cpu(), d.cpu()) for n, (u, d) in c.state.items()}
             self.selector.add(c)
             if c.score < m_best.score:

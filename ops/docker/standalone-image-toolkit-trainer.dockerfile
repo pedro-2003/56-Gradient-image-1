@@ -37,21 +37,12 @@ RUN pip install --timeout 120 --retries 10 --no-cache-dir -r /opt/ComfyUI/requir
 # No dataset and no private artifact is bundled. Trained outputs derive solely from the
 # validator-provided base model and dataset.
 ARG FLUX_TE_REV=6af2a98e3f615bdfa612fbd85da93d1ed5f69ef5
-# one layer per asset: a legacy (non-BuildKit) builder commits each RUN by copying its diff, so the
-# transient disk peak is the largest single file, not the whole 19 GB set
-RUN mkdir -p /opt/crown/assets
-RUN curl -fL --retry 5 -o /opt/crown/assets/qwen_image_vae.safetensors \
-         https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors
-RUN curl -fL --retry 5 -o /opt/crown/assets/flux2-vae.safetensors \
-         https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/vae/flux2-vae.safetensors
-RUN curl -fL --retry 5 -o /opt/crown/assets/clip_l.safetensors \
-         https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/${FLUX_TE_REV}/clip_l.safetensors
-RUN curl -fL --retry 5 -o /opt/crown/assets/t5xxl_fp16.safetensors \
-         https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/${FLUX_TE_REV}/t5xxl_fp16.safetensors
-RUN curl -fL --retry 5 -o /opt/crown/assets/ideogram4_fp8_scaled.safetensors \
-         https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/diffusion_models/ideogram4_fp8_scaled.safetensors
-RUN curl -fL --retry 5 -o /opt/crown/assets/ae.safetensors \
-         https://huggingface.co/rayonlabs/FLUX.1-dev/resolve/main/ae.safetensors
+# Assets the trainer needs that the validator's /cache does not hold (VAEs, flux text encoders,
+# the evaluator's own ideogram4 base for the twin). The validator cold-builds this image with no
+# cache under a 30-minute cap for every task, so the pulls run smallest-first under a hard time
+# budget and NEVER fail the build: a missing file degrades the trainer at run time instead.
+COPY ops/docker/fetch_assets.sh /opt/crown/fetch_assets.sh
+RUN ASSET_BUDGET_S=540 FLUX_TE_REV=${FLUX_TE_REV} bash /opt/crown/fetch_assets.sh
 
 COPY crown /app/crown
 COPY scripts /app/scripts

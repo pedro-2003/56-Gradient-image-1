@@ -164,6 +164,11 @@ class Assets:
         baked = [os.path.join(self.baked_dir, n) for n in C.BAKED_FLUX_TE]
         if all(os.path.exists(b) for b in baked):
             return [load_file(b, device="cpu") for b in baked]
+        # the task repo's own encoders in diffusers layout (text_encoder = CLIP-L, text_encoder_2 =
+        # T5-XXL) carry the same key names as the evaluator's files
+        te1, te2 = os.path.join(self.model_dir, "text_encoder"), os.path.join(self.model_dir, "text_encoder_2")
+        if os.path.isdir(te1) and os.path.isdir(te2) and _shards(te1) and _shards(te2):
+            return [to_bf16(load_sharded(_shards(te1))), to_bf16(load_sharded(_shards(te2)))]
         ck = self._full_checkpoint()
         sds = [sub_dict(ck, "text_encoders.clip_l.transformer."), sub_dict(ck, "text_encoders.t5xxl.transformer.")]
         if not all(sds):
@@ -185,6 +190,9 @@ class Assets:
             baked = os.path.join(self.baked_dir, C.FLUX_VAE_FILE)   # task repos (e.g. PixelWave) ship no ae.safetensors
             if os.path.exists(baked):
                 return "comfy", load_file(baked, device="cpu")
+            dvae = os.path.join(self.model_dir, "vae")               # last resort: the repo's diffusers AutoencoderKL
+            if os.path.isdir(dvae) and os.path.exists(os.path.join(dvae, "config.json")):
+                return "diffusers", dvae
             raise FileNotFoundError(f"flux VAE {C.FLUX_VAE_FILE} not found under {self.model_dir} or {self.baked_dir}")
         baked = os.path.join(self.baked_dir, C.BAKED_VAE[f])
         if os.path.exists(baked):
