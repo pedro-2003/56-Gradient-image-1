@@ -27,7 +27,7 @@ RECIPES = {
     "ideogram4":  ["--rank", "16", "--lr", "2e-4", "--include", "layers[.][0-9]+[.](attention|adaln_modulation|feed_forward)", "--no-ckpt"],   # block layers only: the evaluator re-quantises every patched tensor; the 7 embedder/final-layer tensors alone cost 0.7% (probe_requant 2026-09-24)   # twin released between scores -> fits: 0.68 s/step, peak 64.7 GB (smoke 2026-09-24); the OOM guard re-enables checkpointing if a task needs it
     "z-image":    ["--rank", "16", "--lr", "3e-4"],
     "flux":       ["--rank", "16", "--lr", "3e-4"],
-    "qwen-image": ["--rank", "8", "--lr", "1e-4"],
+    "qwen-image": ["--rank", "8", "--lr", "1e-4", "--include", "transformer_blocks[.][0-9]+[.]attn[.](to_q|to_k|to_v|to_out)"],   # the public champion recipe's target set (240 vs 846 Linears): 1.47 -> ~1.05 s/step; Round 2 can be a qwen knockout
 }
 COMMON = ["--holdout-frac", "0.10", "--holdout-min", "3", "--eval-share", "0.15",
           "--confirm-top", "3", "--confirm-noises", "4", "--ema", "0.99", "--phase2", "--max-members", "2"]
