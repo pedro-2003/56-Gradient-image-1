@@ -278,6 +278,8 @@ class Trainer:
         return rep
 
     def _screens_per_point(self):
+        if self.cfg.ema > 0 and getattr(self.cfg, "screen_ema_only", False):
+            return 1                                  # ema only at intermediate points
         return 2 if self.cfg.ema > 0 else 1          # raw (+ ema); avg2 only at member end
 
     def _eval_every(self):
@@ -395,7 +397,7 @@ class Trainer:
             # reach a comparable optimum (time-to-best of this member, plus its evals) in the time left
             want_phase2 = cfg.phase2 and member + 1 < cfg.max_members
             want_polish = getattr(cfg, "polish", False) and not polishing
-            plateau = (want_phase2 or want_polish or polishing) and self.selector.plateaued(member=member)
+            plateau = (want_phase2 or want_polish or polishing) and self.selector.plateaued(window=getattr(cfg, "plateau_window", 3), member=member)
             if polishing and pol_points >= 3 and plateau:
                 # the anneal has converged too: hand the rest to the confirm stage
                 log(f"m{member} polish plateau at step {step} (best {m_best.tag}@{m_best.step}); {budget.remaining():.0f}s left for confirms")
@@ -461,8 +463,8 @@ class Trainer:
                     pol_points += 1
         # member end: a final screen (if the last eval point is stale) plus the average of the
         # last two raw states — one extra candidate that costs one screen per member, not per point
-        if step > last_eval and not plateau_exit and budget.fits(budget.est_eval() * (self._screens_per_point() + 0.2)):
-            m_best = self._screen_candidates(guider, extra, member, step, ema, raw_hist, m_best, tag_prefix=tag_prefix)
+        if step > last_eval and not plateau_exit and budget.fits(budget.est_eval() * (2.2 if ema is not None else 1.2)):
+            m_best = self._screen_candidates(guider, extra, member, step, ema, raw_hist, m_best, tag_prefix=tag_prefix, final=True)
         if len(raw_hist) >= 2 and budget.fits(budget.est_eval() * 1.2):
             m_best = self._screen_candidates(guider, extra, member, step, None, raw_hist, m_best, avg_only=True, tag_prefix=tag_prefix)
         log(f"member {member} done: steps={step} best={m_best.tag}@{m_best.step} {m_best.score:.6f} plateau_exit={plateau_exit}")
@@ -495,14 +497,16 @@ class Trainer:
             log(f"band repeats (power {power}): {reps}")
         return reps
 
-    def _screen_candidates(self, guider, extra, member, step, ema, raw_hist, m_best, avg_only=False, tag_prefix=""):
+    def _screen_candidates(self, guider, extra, member, step, ema, raw_hist, m_best, avg_only=False, tag_prefix="", final=False):
         lora = self.lora
         cands = []
         if avg_only:
             cands.append(Candidate(tag_prefix + "avg2", step, soup_state(raw_hist[-2:]), lora.scale, member=member))
         else:
             raw_state = {n: (u.detach().cpu().clone(), d.detach().cpu().clone()) for n, (u, d) in lora.state().items()}
-            cands.append(Candidate(tag_prefix + "raw", step, raw_state, lora.scale, member=member))
+            ema_only = ema is not None and getattr(self.cfg, "screen_ema_only", False) and not final
+            if not ema_only:
+                cands.append(Candidate(tag_prefix + "raw", step, raw_state, lora.scale, member=member))
             if ema is not None:
                 cands.append(Candidate(tag_prefix + "ema", step, {n: (t[0].cpu(), t[1].cpu()) for n, t in lora.state_from_flat([e.clone() for e in ema]).items()}, lora.scale, member=member))
             raw_hist.append(raw_state)

@@ -58,6 +58,9 @@ def parse(argv=None):
                    help="when a member plateaus and a second member cannot fit, restart from its best state with a low decaying LR "
                         "for the time left instead of training on past the optimum")
     p.add_argument("--polish-lr-frac", type=float, default=0.3, help="polish peak LR as a fraction of --lr")
+    p.add_argument("--plateau-window", type=int, default=3, help="eval points without a real improvement that count as a plateau")
+    p.add_argument("--screen-ema-only", action="store_true",
+                   help="screen only the EMA candidate at intermediate eval points (raw at the member end), doubling the eval cadence")
     p.add_argument("--band-power", type=float, default=0.0,
                    help="0 = uniform over sigma bands (like the score); p>0 repeats band b (loss_b/median)^p times per pass, "
                         "loss_b being the latest holdout per-band loss - importance sampling toward where the score mass is")
