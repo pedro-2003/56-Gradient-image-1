@@ -122,7 +122,9 @@ class EvaluatorTwin:
         from . import engine
 
         if self.base is None:
-            self.base = engine.load_diffusion_model(self._sd, self.family, self._meta)
+            # Comfy's loader pops keys out of the dict it is given: hand it a copy so the base
+            # can be rebuilt for every score() call
+            self.base = engine.load_diffusion_model(dict(self._sd), self.family, dict(self._meta) if self._meta else self._meta)
 
     def release(self):
         """Drop the twin's model (and any patched clone) from the GPU; the caller reloads the
