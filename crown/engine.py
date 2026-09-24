@@ -342,7 +342,7 @@ class Trainer:
 
         # confirm the top candidates with more noise draws (the evaluator's own draws 0..k-1) —
         # through the evaluator twin where numerics differ — then 1-SE pick
-        top = self.selector.top(cfg.confirm_top)
+        top = self.selector.top(self._confirm_count())
         for c in top:
             if not self.budget.fits(self.budget.est_eval(cfg.confirm_noises) * (1.5 if self.twin else 1.0)):
                 break
@@ -384,7 +384,7 @@ class Trainer:
         step, last_eval, cases, raw_hist = 0, 0, [], []
         m_best = self.best
         plateau_exit = False
-        peak, warm_base, polishing, tag_prefix = cfg.lr, 0, False, ""
+        peak, warm_base, polishing, tag_prefix, pol_points = cfg.lr, 0, False, "", 0
         while True:
             now = time.time()
             due = (step - last_eval) >= self._eval_every()
@@ -395,7 +395,11 @@ class Trainer:
             # reach a comparable optimum (time-to-best of this member, plus its evals) in the time left
             want_phase2 = cfg.phase2 and member + 1 < cfg.max_members
             want_polish = getattr(cfg, "polish", False) and not polishing
-            plateau = (want_phase2 or want_polish) and self.selector.plateaued(member=member)
+            plateau = (want_phase2 or want_polish or polishing) and self.selector.plateaued(member=member)
+            if polishing and pol_points >= 3 and plateau:
+                # the anneal has converged too: hand the rest to the confirm stage
+                log(f"m{member} polish plateau at step {step} (best {m_best.tag}@{m_best.step}); {budget.remaining():.0f}s left for confirms")
+                break
             if plateau and want_phase2:
                 need_next = max(1, m_best.step) * budget.est_step() + 3 * budget.est_eval() + budget.est_eval(cfg.confirm_noises) * cfg.confirm_top
                 if budget.fits(need_next):
@@ -453,6 +457,8 @@ class Trainer:
             if due:
                 last_eval = step
                 m_best = self._screen_candidates(guider, extra, member, step, ema, raw_hist, m_best, tag_prefix=tag_prefix)
+                if polishing:
+                    pol_points += 1
         # member end: a final screen (if the last eval point is stale) plus the average of the
         # last two raw states — one extra candidate that costs one screen per member, not per point
         if step > last_eval and not plateau_exit and budget.fits(budget.est_eval() * (self._screens_per_point() + 0.2)):
@@ -461,6 +467,18 @@ class Trainer:
             m_best = self._screen_candidates(guider, extra, member, step, None, raw_hist, m_best, avg_only=True, tag_prefix=tag_prefix)
         log(f"member {member} done: steps={step} best={m_best.tag}@{m_best.step} {m_best.score:.6f} plateau_exit={plateau_exit}")
         return m_best, plateau_exit
+
+    def _confirm_count(self):
+        """How many top candidates to confirm: at least --confirm-top, more when time is left over
+        (a member that stopped at its plateau leaves it), never more than 8."""
+        cfg = self.cfg
+        per = max(1.0, self.budget.est_eval(cfg.confirm_noises))
+        spare = self.budget.remaining() - C.PUBLISH_RESERVE_S - 30.0
+        k = int(spare // per)
+        k = min(8, max(cfg.confirm_top, k))
+        if k != cfg.confirm_top:
+            log(f"confirm stage: {k} candidates fit at {cfg.confirm_noises} noises ({spare:.0f}s spare, {per:.0f}s each)")
+        return k
 
     def _band_repeats(self):
         """How many times each sigma band appears per case-cycle pass: 1 (uniform) unless --band-power
