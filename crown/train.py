@@ -106,6 +106,9 @@ def main(argv=None):
         hold = [i for i, it in enumerate(items) if it["name"] in wanted]
         if len(hold) != len(wanted):
             raise SystemExit(f"--holdout-names: {sorted(wanted - {items[i]['name'] for i in hold})} not in the dataset")
+        chosen = set(hold)                      # choose_holdout already flagged its own split; re-flag
+        for i, it in enumerate(items):
+            it["holdout"] = i in chosen
     engine.log(f"dataset: {len(items)} images, holdout {len(hold)}: {[items[i]['name'] for i in hold]}")
 
     assets = Assets(cfg.family, cfg.model_dir, cfg.baked_dir)
