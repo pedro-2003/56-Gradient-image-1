@@ -34,6 +34,9 @@ class LoraWrapper:
         if not self.enabled or self.up is None:
             return w
         delta = (self.up.float() @ self.down.float()) * self.scale
+        if w.dtype in (torch.bfloat16, torch.float16):
+            # the evaluator merges in fp16 on sm80+ (lora_compute_dtype) and casts back (v6.1 F4)
+            return (w.to(torch.float16) + delta.reshape(w.shape).to(torch.float16)).to(w.dtype)
         return (w.float() + delta.reshape(w.shape)).to(w.dtype)
 
     def to(self, device):
@@ -83,7 +86,13 @@ class Lora:
                 return False, f"target {name} missing in {path}"
             if tuple(up.shape) != (out_f, self.rank) or tuple(down.shape) != (self.rank, in_f):
                 return False, f"shape mismatch at {name}: up {tuple(up.shape)} down {tuple(down.shape)} vs rank {self.rank}"
-            st[name] = (up.float(), down.float())
+            alpha = sd.get(f"{k}.alpha")
+            up = up.float()
+            if alpha is not None:                  # the file's own scale, re-expressed under this run's scale (v6.1 F6)
+                file_scale = float(alpha) / down.shape[0]
+                if abs(file_scale - self.scale) > 1e-9:
+                    up = up * (file_scale / self.scale)
+            st[name] = (up, down.float())
         extra = sum(1 for k in sd if k.endswith(".lora_up.weight")) - len(st)
         self._init = st
         self.load_state(st)

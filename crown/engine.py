@@ -392,7 +392,7 @@ class Trainer:
             m_best, plateau_exit = self._train_member(guider, extra, member)
             members.append(m_best)
             self.summary["members"].append({"member": member, "best_tag": m_best.tag, "best_step": m_best.step,
-                                            "score": m_best.score, "plateau_exit": plateau_exit})
+                                            "best_member": m_best.member, "score": m_best.score, "plateau_exit": plateau_exit})
             # phase 2: the member returned early because its holdout plateaued and the
             # remaining budget can plausibly carry a fresh member to a comparable optimum
             if getattr(cfg, "replan", False):
@@ -441,7 +441,7 @@ class Trainer:
         self.summary["final_loadable"] = {"ok": ok, "missing": missing[:5]}
         if not ok:
             log(f"FINAL ARTIFACT NOT LOADABLE ({missing[:3]}); falling back to best loadable candidate")
-            for alt in sorted([c for c in self.selector.cands if c is not picked], key=lambda c: c.score):
+            for alt in sorted([c for c in self.selector.cands if c is not picked and not c.unloadable], key=lambda c: c.score):
                 ok2, _ = self._final_loadable(alt.state, alt.scale)
                 if ok2:
                     picked = alt

@@ -89,11 +89,13 @@ class EvaluatorTwin:
                 raise FileNotFoundError(f"twin needs the evaluator's base at {path}")
             sd, meta = comfy.utils.load_torch_file(path, safe_load=True, device=torch.device("cpu"), return_metadata=True)
             self.source = path
-        elif family == "qwen-image":
-            sd, meta = assets.diffusion_sd(), None    # same plain-fp8 file the evaluator picks
-            self.source = "cache (same file as evaluator)"
         else:
-            raise ValueError(f"twin not needed for {family}: bf16 hook path == evaluator numerics")
+            # qwen-image, or any family whose base file is fp8 (e.g. an fp8 FLUX checkpoint): the same
+            # file the evaluator picks, merged the evaluator's way (v6.1 F1)
+            sd, meta = assets.diffusion_sd(), assets.diffusion_meta()
+            if not getattr(assets, "base_fp8", False) and family != "qwen-image":
+                raise ValueError(f"twin not needed for {family}: bf16 hook path == evaluator numerics")
+            self.source = "cache (same file as evaluator)"
         # the base is built on demand (score) and released afterwards: it must not occupy the GPU
         # while the trainer runs (9.3 GB on ideogram4, 20 GB on qwen-image)
         self._sd, self._meta = sd, meta

@@ -150,8 +150,13 @@ def main():
     class FakeTwin:
         """Same numerics as the hook path in the mock; exercises the twin control flow + loader check."""
         source = "mock"
+        base = model                      # the evaluator-path final check verifies against the twin's base
         def __init__(self, tr_ref):
             self.tr_ref = tr_ref
+        def _load(self):
+            pass
+        def release(self):
+            pass
         def score(self, state, scale, noises=1):
             tr = self.tr_ref[0]
             from crown.twin import apply_lora_like_evaluator

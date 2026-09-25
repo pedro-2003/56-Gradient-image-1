@@ -115,8 +115,29 @@ class Assets:
             roots = _root_safetensors(self.model_dir)
             if not roots:
                 raise FileNotFoundError(f"no root checkpoint under {self.model_dir}")
+            # the evaluator's rule (image_artifacts.prepare_base): exactly ONE root .safetensors > 5 GiB,
+            # else it raises for every miner; we take the largest and say so when the repo is ambiguous
+            big = [r for r in roots if os.path.getsize(r) > 5 * 1024 ** 3]
+            if len(big) != 1:
+                _note(f"root checkpoints > 5 GiB: {len(big)} (evaluator wants exactly one); using {os.path.basename(roots[0])}")
             self._ckpt = load_sharded(roots[:1])
+            try:                                   # header metadata (e.g. _quantization_metadata) goes to Comfy like load_torch_file's
+                from safetensors import safe_open
+
+                with safe_open(roots[0], "pt") as f:
+                    self._ckpt_meta = f.metadata() or None
+            except Exception:  # noqa: BLE001
+                self._ckpt_meta = None
         return self._ckpt
+
+    def diffusion_meta(self):
+        """Safetensors header metadata of the root checkpoint (None for directory layouts)."""
+        if getattr(self, "_ckpt_meta", None) is None and self._ckpt is None:
+            try:
+                self._full_checkpoint()
+            except Exception:  # noqa: BLE001
+                return None
+        return getattr(self, "_ckpt_meta", None)
 
     def diffusion_sd(self):
         f = self.family
@@ -138,18 +159,23 @@ class Assets:
             return sd
         if f == "flux":
             # rayonlabs/FLUX.1-dev: flux1-dev.safetensors is a bare diffusion model (double_blocks.*,
-            # single_blocks.*, ...), exactly what the evaluator's UNETLoader reads. If a full
-            # checkpoint with a model.diffusion_model. prefix ever appears instead, strip it.
+            # single_blocks.*, ...), exactly what the evaluator's UNETLoader reads. A full checkpoint
+            # (model.diffusion_model. prefix, e.g. FLUX-MonochromeManga) is stripped. fp8 weights stay
+            # fp8: the evaluator keeps them and merges with stochastic rounding (v6.1 F1), so the twin
+            # scores such a base, exactly as for qwen-image.
             sd = self._full_checkpoint()
             inner = sub_dict(sd, "model.diffusion_model.")
-            return to_bf16(inner if inner else sd)
+            sd = inner if inner else sd
+            self.base_fp8 = any(v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for v in sd.values())
+            return sd if self.base_fp8 else to_bf16(sd)
         roots = _root_safetensors(self.model_dir)
         if f == "krea2":
             # the evaluator takes the single root file > 5 GB; the repo's is raw.safetensors
             pref = [r for r in roots if "raw" in os.path.basename(r).lower()] or roots
             return to_bf16(load_sharded(pref[:1]))
-        sd = load_sharded(roots[:1])
-        if any(v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for v in sd.values()):
+        sd = self._full_checkpoint() if roots else load_sharded(roots[:1])
+        self.base_fp8 = any(v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for v in sd.values())
+        if self.base_fp8:
             return sd  # qwen-image: plain fp8, keep it (Comfy manual_cast == evaluator path)
         return to_bf16(sd)
 

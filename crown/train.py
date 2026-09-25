@@ -165,7 +165,8 @@ def main(argv=None):
     engine.log(f"{len(raw_conds)} prompts encoded in {time.time() - t:.0f}s")
 
     t = time.time()
-    model = engine.load_diffusion_model(assets.diffusion_sd(), cfg.family)
+    model = engine.load_diffusion_model(assets.diffusion_sd(), cfg.family, assets.diffusion_meta())
+    base_fp8 = getattr(assets, "base_fp8", False)
     assets.release()
     gc.collect()
     for it in items:
@@ -175,7 +176,7 @@ def main(argv=None):
                f"{sum(p.numel() for p in model.model.diffusion_model.parameters()) / 1e9:.2f}B")
 
     twin = None
-    if cfg.twin and cfg.family in ("ideogram4", "qwen-image") and not cfg.identity_only:
+    if cfg.twin and (cfg.family in ("ideogram4", "qwen-image") or base_fp8):
         from crown.twin import EvaluatorTwin
 
         try:
