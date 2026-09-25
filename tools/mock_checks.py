@@ -248,10 +248,54 @@ def trailing_ignores_0():
     assert sel.trailing_improvements(0) == 1
 
 
+def _sim():
+    spec2 = importlib.util.spec_from_file_location("sim_budget", os.path.join(HERE, "sim_budget.py"))
+    m = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(m)
+    return m
+
+
+def screen_passes_schedule():
+    """--screen-passes: screens land on pass multiples, never closer than the share cap allows."""
+    tr, guider, extra, out, _ = build(seconds=20, screen_passes="0.5,1,1.5,2,3", screen_max_share=0.3)
+    ps = tr._pass_steps()
+    tr.budget.observe_step(1.0)
+    tr.budget.observe_eval(1.0)                       # cheap screens: the schedule itself governs
+    s1 = tr._next_screen_step(0)
+    assert s1 == round(0.5 * ps), f"first screen {s1} != 0.5 pass ({ps} steps/pass)"
+    s2 = tr._next_screen_step(s1)
+    assert s2 == round(1.0 * ps), f"second screen {s2} != 1 pass"
+    tr.budget.eval_time = 1000.0                      # very expensive screens: the share cap must widen the gap
+    s3 = tr._next_screen_step(s2)
+    gap_min = 1000.0 * tr._screens_per_point() * 0.7 / (0.3 * 1.0)
+    assert s3 - s2 >= gap_min - 1, f"gap {s3 - s2} below the share cap {gap_min:.0f}"
+
+
+def seed2_fits_or_declines():
+    """--seed2 (virtual clock, measured profiles): runs where the arithmetic allows, declines cleanly where not."""
+    sim = _sim()
+    pol = {"name": "t", "screen_passes": sim.SCHED, "seed2": True}
+    r_fit = sim.Sim("z-image", 1.0, 32, 4, pol).run()
+    assert r_fit["seed2"] and not r_fit["seed2"].get("skipped"), f"seed2 did not run on boss z-image: {r_fit['seed2']}"
+    r_no = sim.Sim("krea2", 0.75, 20, 3, pol).run()
+    assert not r_no["seed2"] or r_no["seed2"].get("skipped") is None, f"unexpected seed2 state {r_no['seed2']}"
+    for r in (r_fit, r_no):
+        assert r["slack_min"] >= 2.0, f"{r['family']}: ends {r['slack_min']} min before the deadline (margin broken)"
+
+
+def replan_no_dead_time():
+    """--replan never exits member 0 into a replan that then declines (the 17-20 min dead-time defect)."""
+    sim = _sim()
+    r = sim.Sim("ideogram4", 1.0, 30, 4, {"name": "t", "replan": True}).run()
+    assert r["slack_min"] < 9.0, f"run ended {r['slack_min']} min early (dead time)"
+
+
 if __name__ == "__main__":
     for name, fn in [("identity_first", identity_first), ("restore_on_error", restore_on_error), ("per_member_soup", per_member_soup),
                      ("nonfinite_skip", nonfinite_skip), ("unloadable_veto", unloadable_veto), ("selector_rules", selector_rules),
-                     ("cadence_cap", cadence_cap), ("trailing_ignores_0", trailing_ignores_0)]:
+                     ("cadence_cap", cadence_cap), ("trailing_ignores_0", trailing_ignores_0),
+                     ("screen_passes_schedule", screen_passes_schedule), ("seed2_fits_or_declines", seed2_fits_or_declines),
+                     ("replan_no_dead_time", replan_no_dead_time)]:
         check(name, fn)
     bad = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(bad)}/{len(RESULTS)} checks passed")
