@@ -20,6 +20,11 @@ from safetensors.torch import load_file
 from . import contract as C
 
 
+def _note(msg):
+    """Asset-source audit line; the never-lose panel counts '[assets] fallback' lines."""
+    print(f"[assets] {msg}", flush=True)
+
+
 # --- file helpers --------------------------------------------------------------
 
 def _shards(dir_path):
@@ -153,6 +158,7 @@ class Assets:
             d = hf_snapshot_dir(repo)
             if d is None:
                 d = os.path.join(self.model_dir, "text_encoder")
+                _note(f"fallback: text encoder {repo} not in hf_cache, using {d}")
             sd = load_sharded(_shards(d))
             if any(v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for v in sd.values()):
                 sd = dequantize_scaled_fp8(sd)
@@ -163,12 +169,15 @@ class Assets:
         # embedded encoders only if someone ships one
         baked = [os.path.join(self.baked_dir, n) for n in C.BAKED_FLUX_TE]
         if all(os.path.exists(b) for b in baked):
+            _note("text encoders: baked clip_l + t5xxl")
             return [load_file(b, device="cpu") for b in baked]
         # the task repo's own encoders in diffusers layout (text_encoder = CLIP-L, text_encoder_2 =
         # T5-XXL) carry the same key names as the evaluator's files
         te1, te2 = os.path.join(self.model_dir, "text_encoder"), os.path.join(self.model_dir, "text_encoder_2")
         if os.path.isdir(te1) and os.path.isdir(te2) and _shards(te1) and _shards(te2):
+            _note("fallback: text encoders from the task repo's text_encoder/text_encoder_2")
             return [to_bf16(load_sharded(_shards(te1))), to_bf16(load_sharded(_shards(te2)))]
+        _note("fallback: text encoders embedded in the checkpoint")
         ck = self._full_checkpoint()
         sds = [sub_dict(ck, "text_encoders.clip_l.transformer."), sub_dict(ck, "text_encoders.t5xxl.transformer.")]
         if not all(sds):
@@ -183,21 +192,27 @@ class Assets:
         if f == "flux":
             ae = os.path.join(self.model_dir, C.FLUX_VAE_FILE)   # the evaluator's rayonlabs/FLUX.1-dev/ae.safetensors
             if os.path.exists(ae):
+                _note("vae: repo ae.safetensors")
                 return "comfy", load_file(ae, device="cpu")
             embedded = sub_dict(self._full_checkpoint(), "vae.")
             if embedded:
+                _note("fallback: vae embedded in the checkpoint")
                 return "comfy", embedded
             baked = os.path.join(self.baked_dir, C.FLUX_VAE_FILE)   # task repos (e.g. PixelWave) ship no ae.safetensors
             if os.path.exists(baked):
+                _note("vae: baked ae.safetensors (repo ships none)")
                 return "comfy", load_file(baked, device="cpu")
             dvae = os.path.join(self.model_dir, "vae")               # last resort: the repo's diffusers AutoencoderKL
             if os.path.isdir(dvae) and os.path.exists(os.path.join(dvae, "config.json")):
+                _note("fallback: vae from the repo's diffusers vae/ (evaluator parity not guaranteed)")
                 return "diffusers", dvae
             raise FileNotFoundError(f"flux VAE {C.FLUX_VAE_FILE} not found under {self.model_dir} or {self.baked_dir}")
         baked = os.path.join(self.baked_dir, C.BAKED_VAE[f])
         if os.path.exists(baked):
+            _note("vae: baked")
             return "comfy", load_file(baked, device="cpu")
         # fallback keeps the run alive; parity with the evaluator's VAE is then not guaranteed
+        _note("fallback: vae from the repo's diffusers vae/ (evaluator parity not guaranteed)")
         return "diffusers", os.path.join(self.model_dir, "vae")
 
     def release(self):
