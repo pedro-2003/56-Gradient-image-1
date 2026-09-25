@@ -49,6 +49,8 @@ def _root_safetensors(model_dir, min_bytes=1 << 30):
 
 
 def resolve_model_dir(model_id: str) -> str:
+    if os.path.isdir(model_id):          # the validator may pass a cached model PATH (docs/miner.md)
+        return model_id
     cand = str(C.cached_model_dir(model_id))
     if os.path.isdir(cand):
         return cand
@@ -62,8 +64,8 @@ def hf_snapshot_dir(repo: str):
     flat = str(C.CACHE_HF / repo.replace("/", "--"))
     if os.path.isdir(flat) and _shards(flat):
         return flat
-    snaps = glob.glob(str(C.CACHE_HF / ("models--" + repo.replace("/", "--")) / "snapshots" / "*"))
-    if snaps:
+    snaps = [s for s in glob.glob(str(C.CACHE_HF / ("models--" + repo.replace("/", "--")) / "snapshots" / "*")) if _shards(s)]
+    if snaps:                             # a snapshot dir whose shards never landed is not a snapshot
         return sorted(snaps)[-1]
     return None
 

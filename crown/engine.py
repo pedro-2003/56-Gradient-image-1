@@ -230,11 +230,13 @@ class Trainer:
     def _screen(self, guider, extra, cand: Candidate, noises=1):
         self.lora.set_tensors(cand.state, cand.scale)
         t0 = time.time()
-        rep = self.scorer.score(guider, extra, lambda p, it: self._set_cond(guider, p, it), noises=noises)
+        try:
+            rep = self.scorer.score(guider, extra, lambda p, it: self._set_cond(guider, p, it), noises=noises)
+        finally:
+            self.lora.restore()      # an OOM or a non-finite case must never leave the wrappers on a candidate (v6.1 M2)
         dt = time.time() - t0
         if noises == 1:
             self.band_loss = self._per_band(rep)   # latest screened candidate's per-band loss (for --band-power)
-        self.lora.restore()
         if noises == 1:
             self.budget.observe_eval(dt)
             cand.screen = rep
@@ -250,12 +252,14 @@ class Trainer:
     def _reload_training_model(self):
         """After the twin's patched clone was loaded, make sure the training model (with
         its LoRA hooks) is resident on the GPU again — Comfy may have evicted it."""
-        try:
-            import comfy.model_management as mm
+        import comfy.model_management as mm
 
+        try:
             mm.load_models_gpu([self.model])
-        except Exception as e:
-            log(f"reload training model: {type(e).__name__}: {e}")
+        except Exception as e:          # once more after freeing the cache; a second failure is fatal, not silent (v6.1 m7)
+            log(f"reload training model: {type(e).__name__}: {e}; retrying after empty_cache")
+            torch.cuda.empty_cache()
+            mm.load_models_gpu([self.model])
 
     def _twin_score(self, state, scale, noises):
         try:
@@ -275,6 +279,7 @@ class Trainer:
         if rep is None:
             log(f"[twin m{cand.member} step {cand.step}] {cand.tag}: NOT LOADABLE by the evaluator: {missing[:3]}")
             self.summary.setdefault("twin_unloadable", []).append({"tag": cand.tag, "step": cand.step, "missing": missing[:5]})
+            cand.unloadable = True       # vetoed: the selector never ranks or ships it (v6.1 M6)
             return None
         cand.confirm = rep
         tb = (self.summary.get("parity") or {}).get("twin_base")   # twin numbers compare against the twin base
@@ -289,6 +294,26 @@ class Trainer:
         if self.cfg.ema > 0 and getattr(self.cfg, "screen_ema_only", False):
             return 1                                  # ema only at intermediate points
         return 2 if self.cfg.ema > 0 else 1          # raw (+ ema); avg2 only at member end
+
+    def _final_loadable(self, state, scale):
+        """Loadability of a state on the evaluator's path: the twin's base (fp8 families) when there is
+        one, else the training model. Any twin failure falls back to the training model (v6.1 M6)."""
+        dev_state = {n: (u.to(self.device), d.to(self.device)) for n, (u, d) in state.items()}
+        if self.twin is not None:
+            try:
+                self.twin._load()
+                ok, missing = verify_loadable(self.twin.base, dev_state, scale)
+                self.twin.release()
+                self._reload_training_model()
+                return ok, missing
+            except Exception as e:  # noqa: BLE001
+                log(f"final loadability via twin failed ({type(e).__name__}: {e}); using the training model")
+                try:
+                    self.twin.release()
+                    self._reload_training_model()
+                except Exception:  # noqa: BLE001
+                    pass
+        return verify_loadable(self.model, dev_state, scale)
 
     def _eval_every(self, member=None):
         """Steps between eval points so that screening takes ~cfg.eval_share of wall-clock. With
@@ -305,6 +330,8 @@ class Trainer:
             return base
         r = self.selector.trailing_improvements(member)
         factor = min(3.0, 1.0 + 0.5 * r)
+        # never widen past what the horizon can still hold: at least two more screens must fit (v6.1 m9)
+        factor = min(factor, max(1.0, self.budget.steps_affordable() / (2.0 * base)))
         if factor != getattr(self, "_cadence_factor", 1.0):
             self._cadence_factor = factor
             log(f"cadence: {r} consecutive improvements -> screens every {int(base * factor)} steps (x{factor:.1f})")
@@ -320,9 +347,12 @@ class Trainer:
         import crown.selector as _sel
         _sel.SEL_METRIC = getattr(cfg, "select_metric", "mean") or "mean"
 
-        # base: identity LoRA (up == 0). Saved before any training so an artifact always exists.
-        ident = Candidate("identity", 0, self.lora.state(), self.lora.scale)
+        # base: identity LoRA (up == 0), parked on the CPU like every other candidate state and saved
+        # BEFORE the first screen, so an artifact exists whatever the first forward does (v6.1 m1/m2)
+        ident = Candidate("identity", 0, {n: (u.detach().cpu(), d.detach().cpu()) for n, (u, d) in self.lora.state().items()}, self.lora.scale)
         self.base_score = None
+        self.best = ident
+        self.save(ident.state, ident.scale, float("nan"), "identity")
         if self.prior_loaded:
             # with a warm start the step-0 state is the prior, not the base: score the true base too so
             # every "vs base" number keeps its meaning and the prior's own effect is visible at once
@@ -372,8 +402,9 @@ class Trainer:
             member += 1
             log(f"plateau reached with {self.budget.remaining():.0f}s left; starting member {member}")
 
-        # soup of member bests (exact rank-concat average), scored like any candidate
-        if len(members) > 1 and self.budget.fits(self.budget.est_eval()):
+        # soup of member bests (exact rank-concat average), scored like any candidate; only when the
+        # members' bests are distinct states (v6.1 M3: a member without a best of its own is skipped)
+        if len(members) > 1 and len({id(m.state) for m in members}) == len(members) and self.budget.fits(self.budget.est_eval()):
             sc = Candidate("soup", self.summary["steps"], soup_state([m.state for m in members]), self.lora.scale, member=-1)
             self._screen(guider, extra, sc)
             self.selector.add(sc)
@@ -383,25 +414,35 @@ class Trainer:
         replan_soup = None
         if getattr(cfg, "replan", False):
             replan_soup = self._replan(guider, extra, members)
+        if replan_soup is not None:
+            # the soup ships on the probe gate (see _replan); the confirm stage is only its loadability
+            # check through the twin (v6.1 M5/M6), the other candidates are not confirmed
+            if self.budget.fits(self.budget.est_eval(cfg.confirm_noises) * (1.5 if self.twin else 1.0)):
+                self._confirm(guider, extra, replan_soup)
+            if replan_soup.unloadable:
+                log("replan: soup NOT loadable by the evaluator; falling back to the 1-SE pick")
+                replan_soup = None
 
         # confirm the top candidates with more noise draws (the evaluator's own draws 0..k-1) —
         # through the evaluator twin where numerics differ — then 1-SE pick
-        top = self.selector.top(self._confirm_count())
+        top = [] if replan_soup is not None else self.selector.top(self._confirm_count())
         for c in top:
             if not self.budget.fits(self.budget.est_eval(cfg.confirm_noises) * (1.5 if self.twin else 1.0)):
                 break
             self._confirm(guider, extra, c)
         picked = self.selector.pick(use_confirm=any(c.confirm is not None for c in top)) or self.best
         if replan_soup is not None:
+            base_pick = picked
             picked = replan_soup
-            log(f"replan: shipping {replan_soup.tag} (blind members on all images) over {picked.tag if picked is not replan_soup else 'the 1-SE pick'}")
-        # never ship something the evaluator cannot load: check the final state on the real loader path
-        ok, missing = verify_loadable(self.model, {n: (u.to(self.device), d.to(self.device)) for n, (u, d) in picked.state.items()}, picked.scale)
+            log(f"replan: shipping {replan_soup.tag} (blind members on all images) over {base_pick.tag}@{base_pick.step}")
+        # never ship something the evaluator cannot load: check the final state on the evaluator's own
+        # loader path (the twin's base where numerics differ, else the training model)
+        ok, missing = self._final_loadable(picked.state, picked.scale)
         self.summary["final_loadable"] = {"ok": ok, "missing": missing[:5]}
         if not ok:
             log(f"FINAL ARTIFACT NOT LOADABLE ({missing[:3]}); falling back to best loadable candidate")
             for alt in sorted([c for c in self.selector.cands if c is not picked], key=lambda c: c.score):
-                ok2, _ = verify_loadable(self.model, {n: (u.to(self.device), d.to(self.device)) for n, (u, d) in alt.state.items()}, alt.scale)
+                ok2, _ = self._final_loadable(alt.state, alt.scale)
                 if ok2:
                     picked = alt
                     break
@@ -429,7 +470,8 @@ class Trainer:
         # this member's wall-clock horizon: whatever is left, minus what the confirm stage will need
         horizon_end = time.time() + max(60.0, budget.remaining() - budget.est_eval(cfg.confirm_noises) * cfg.confirm_top)
         step, last_eval, cases, raw_hist = 0, 0, [], []
-        m_best = self.best
+        m_best = None            # this member's own best (v6.1 M3), separate from the global self.best
+        bad = 0                  # consecutive non-finite steps (v6.1 M4)
         plateau_exit = False
         peak, warm_base, polishing, tag_prefix, pol_points = cfg.lr, 0, False, "", 0
         while True:
@@ -443,18 +485,19 @@ class Trainer:
             want_phase2 = cfg.phase2 and member + 1 < cfg.max_members
             want_polish = getattr(cfg, "polish", False) and not polishing
             plateau = (want_phase2 or want_polish or polishing) and self.selector.plateaued(window=getattr(cfg, "plateau_window", 3), member=member)
+            mb = m_best or self.best
             if polishing and pol_points >= 3 and plateau:
                 # the anneal has converged too: hand the rest to the confirm stage
-                log(f"m{member} polish plateau at step {step} (best {m_best.tag}@{m_best.step}); {budget.remaining():.0f}s left for confirms")
+                log(f"m{member} polish plateau at step {step} (best {mb.tag}@{mb.step}); {budget.remaining():.0f}s left for confirms")
                 break
             if plateau and want_phase2:
-                need_next = max(1, m_best.step) * budget.est_step() + 3 * budget.est_eval() + budget.est_eval(cfg.confirm_noises) * cfg.confirm_top
+                need_next = max(1, mb.step) * budget.est_step() + 3 * budget.est_eval() + budget.est_eval(cfg.confirm_noises) * cfg.confirm_top
                 if budget.fits(need_next):
                     plateau_exit = True
-                    log(f"m{member} plateau at step {step} (best {m_best.tag}@{m_best.step}); handing {budget.remaining():.0f}s to the next member")
+                    log(f"m{member} plateau at step {step} (best {mb.tag}@{mb.step}); handing {budget.remaining():.0f}s to the next member")
                     break
             if plateau and want_polish:
-                if (m_best.step > 0 and m_best.member == member
+                if (m_best is not None and m_best.step > 0 and m_best.member == member
                         and horizon_end - now > 3 * budget.est_eval() + 60):
                     # anneal from the best state with a low, decaying LR for the time left, instead of
                     # training on past the optimum (the champion's telemetry shows 50-90% of budget lost there)
@@ -497,6 +540,17 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(lora.params, cfg.grad_clip)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
+                bad = 0
+            except (ValueError, FloatingPointError):
+                # one non-finite case (flow_prediction_mse raises) skips the step instead of ending the run (v6.1 M4)
+                opt.zero_grad(set_to_none=True)
+                noisy = den = loss = None
+                bad += 1
+                self.summary["nonfinite"] = self.summary.get("nonfinite", 0) + 1
+                if bad >= 20:
+                    log(f"m{member} {bad} consecutive non-finite losses at step {step}: stopping this member with best-so-far")
+                    break
+                continue
             except torch.OutOfMemoryError:
                 # fail closed: never let one OOM end the run with the identity artifact
                 opt.zero_grad(set_to_none=True)
@@ -531,6 +585,7 @@ class Trainer:
             m_best = self._screen_candidates(guider, extra, member, step, ema, raw_hist, m_best, tag_prefix=tag_prefix, final=True)
         if len(raw_hist) >= 2 and budget.fits(budget.est_eval() * 1.2):
             m_best = self._screen_candidates(guider, extra, member, step, None, raw_hist, m_best, avg_only=True, tag_prefix=tag_prefix)
+        m_best = m_best or self.best          # a member that never screened has no best of its own
         log(f"member {member} done: steps={step} best={m_best.tag}@{m_best.step} {m_best.score:.6f} plateau_exit={plateau_exit}")
         return m_best, plateau_exit
 
@@ -546,7 +601,7 @@ class Trainer:
         (a member that stopped at its plateau leaves it), never more than 8."""
         cfg = self.cfg
         per = max(1.0, self.budget.est_eval(cfg.confirm_noises))
-        spare = self.budget.remaining() - C.PUBLISH_RESERVE_S - 30.0
+        spare = self.budget.remaining() - 30.0        # remaining() already nets the publish reserve (v6.1 m6)
         k = int(spare // per)
         k = min(8, max(cfg.confirm_top, k))
         if k != cfg.confirm_top:
@@ -602,15 +657,33 @@ class Trainer:
             return None
         log(f"replan: s*={m0.step} -> {steps} steps on all {n_all} images x {k} blind members ({per_member:.0f}s each, {budget.remaining():.0f}s left)")
         states = [m.state for m in members]          # every holdout-selected best, then the blind ones
-        for j in range(k):
+        # gate (v6.1 M5): the first blind member trains on the TRAINING images only, so its holdout screen
+        # is uncontaminated; if the blind recipe at s* does not reproduce member 0's quality (worse by more
+        # than the paired SE) the replan is abandoned before any contaminated member is trained
+        self.lora.reinit(cfg.seed + 1000 * 100)
+        st = self._train_fixed(guider, extra, 100, m0.step, items=self.train_items)
+        if st is None or not budget.fits(budget.est_eval() + reserve):
+            self.summary["replan"] = {"skipped": "probe did not finish", "steps": m0.step}
+            return None
+        probe = Candidate("blind-probe", self.summary["steps"], st, self.lora.scale, member=100)
+        self._screen(guider, extra, probe)
+        self.selector.add(probe)
+        mean, se, n = probe.screen.paired_diff(m0.screen)
+        if n > 1 and mean > se:
+            log(f"replan: blind probe {probe.score:.6f} vs member-0 best {m0.screen.score:.6f} (+{mean:.5f} > SE {se:.5f}): recipe not reproduced; skipped")
+            self.summary["replan"] = {"skipped": "probe worse than member 0", "probe": probe.score, "m0": m0.screen.score}
+            return None
+        log(f"replan: blind probe {probe.score:.6f} vs member-0 best {m0.screen.score:.6f} within SE: recipe reproduced, training on all images")
+        states.append(st)
+        for j in range(1, k):
             member = 100 + j                     # blind members are numbered from 100
+            if not budget.fits(per_member + reserve):
+                break
             self.lora.reinit(cfg.seed + 1000 * member)
             st = self._train_fixed(guider, extra, member, steps)
             if st is None:
                 break
             states.append(st)
-            if not budget.fits(per_member + reserve):
-                break
         if len(states) < 2:
             self.summary["replan"] = {"skipped": "no member finished", "steps": steps}
             return None
@@ -626,15 +699,16 @@ class Trainer:
         log(f"replan: soup of {len(states)} states screens {soup.score:.6f} vs member-0 best {m0.screen.score:.6f} -> {'ship' if ok else 'REJECTED'}")
         return soup if ok else None
 
-    def _train_fixed(self, guider, extra, member, steps):
-        """Blind member: exactly `steps` steps on ALL images, cosine annealed over those steps, EMA
-        state returned; no screens. Stops early (returns None) only on the budget or a second OOM."""
+    def _train_fixed(self, guider, extra, member, steps, items=None):
+        """Blind member: exactly `steps` steps on `items` (default ALL images), cosine annealed over
+        those steps, EMA state returned; no screens. Stops early (returns None) only on the budget or a
+        second OOM."""
         cfg, lora, budget = self.cfg, self.lora, self.budget
         groups = [{"params": lora.up_params, "lr_mult": cfg.lora_plus_ratio}, {"params": lora.down_params, "lr_mult": 1.0}]
         opt = torch.optim.AdamW(groups, lr=cfg.lr, betas=(0.9, 0.99), weight_decay=cfg.weight_decay, eps=1e-8)
         ema = [p.detach().clone() for p in lora.params] if cfg.ema > 0 else None
         gen = torch.Generator(device="cpu").manual_seed(cfg.seed + 7919 * member)
-        items = self.items
+        items = items if items is not None else self.items
         cases = []
         step = 0
         t_start = time.time()
@@ -666,6 +740,11 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(lora.params, cfg.grad_clip)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
+            except (ValueError, FloatingPointError):
+                opt.zero_grad(set_to_none=True)
+                noisy = den = loss = None
+                self.summary["nonfinite"] = self.summary.get("nonfinite", 0) + 1
+                continue
             except torch.OutOfMemoryError:
                 opt.zero_grad(set_to_none=True)
                 noisy = den = loss = None
@@ -705,19 +784,21 @@ class Trainer:
             if ema is not None:
                 cands.append(Candidate(tag_prefix + "ema", step, {n: (t[0].cpu(), t[1].cpu()) for n, t in lora.state_from_flat([e.clone() for e in ema]).items()}, lora.scale, member=member))
             raw_hist.append(raw_state)
+            del raw_hist[:-2]                     # only the last two raw states are ever used (v6.1 m5)
         for c in cands:
             c.state = {n: (u.to(self.device), d.to(self.device)) for n, (u, d) in c.state.items()}
             try:
                 self._screen(guider, extra, c)
-            except torch.OutOfMemoryError:
+            except (torch.OutOfMemoryError, ValueError, FloatingPointError) as e:
                 torch.cuda.empty_cache()
-                self.summary["oom"] = self.summary.get("oom", 0) + 1
-                log(f"screen OOM at step {step} ({c.tag}): candidate skipped ({self._mem()})")
+                key = "oom" if isinstance(e, torch.OutOfMemoryError) else "nonfinite"
+                self.summary[key] = self.summary.get(key, 0) + 1
+                log(f"screen {key} at step {step} ({c.tag}): candidate skipped ({self._mem()})")
                 c.state = {n: (u.cpu(), d.cpu()) for n, (u, d) in c.state.items()}
                 continue
             c.state = {n: (u.cpu(), d.cpu()) for n, (u, d) in c.state.items()}
             self.selector.add(c)
-            if c.score < m_best.score:
+            if m_best is None or c.score < m_best.score:
                 m_best = c
             if c.score < self.best.score:
                 self.best = c

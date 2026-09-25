@@ -35,6 +35,7 @@ class Candidate:
     screen: Optional[ScoreReport] = None
     confirm: Optional[ScoreReport] = None
     member: int = 0
+    unloadable: bool = False      # the evaluator twin refused this state: never ship or rank it (v6.1 M6)
 
     @property
     def score(self):
@@ -68,19 +69,24 @@ class Selector:
             self.history.append((cand.step, sel_score(cand.screen)))
 
     def best(self, confirmed_only=False) -> Optional[Candidate]:
-        pool = [c for c in self.cands if (c.confirm if confirmed_only else (c.confirm or c.screen)) is not None]
+        pool = [c for c in self.cands if not c.unloadable and (c.confirm if confirmed_only else (c.confirm or c.screen)) is not None]
         return min(pool, key=lambda c: c.score) if pool else None
 
     def top(self, k: int, member=None):
-        pool = [c for c in self.cands if c.screen is not None and (member is None or c.member == member)]
-        return sorted(pool, key=lambda c: sel_score(c.screen))[:k]
+        """The k best screened candidates, one per eval point (member, step): raw/ema twins of one
+        step must not crowd out other steps in the confirm stage (v6.1 m4)."""
+        pool = [c for c in self.cands if c.screen is not None and not c.unloadable and (member is None or c.member == member)]
+        per_point = {}
+        for c in sorted(pool, key=lambda c: sel_score(c.screen)):
+            per_point.setdefault((c.member, c.step), c)
+        return list(per_point.values())[:k]
 
     # --- 1-SE rule ------------------------------------------------------------------
     def pick(self, use_confirm=True) -> Optional[Candidate]:
         """Among candidates whose paired difference to the best is within one SE,
         return the earliest one. Earlier = less overfit direction, by the measured
         monotone overfit curves; the rule never picks something significantly worse."""
-        pool = [c for c in self.cands if (c.confirm if use_confirm else c.screen) is not None]
+        pool = [c for c in self.cands if not c.unloadable and (c.confirm if use_confirm else c.screen) is not None]
         if not pool:
             return self.best()
         rep = (lambda c: c.confirm) if use_confirm else (lambda c: c.screen)
@@ -92,7 +98,7 @@ class Selector:
             mean, se, n = rep(c).paired_diff(rep(b))
             if n > 1 and mean <= se:      # c - b <= SE  → not distinguishably worse
                 within.append(c)
-        return min(within, key=lambda c: c.step)
+        return min(within, key=lambda c: (c.step, rep(c).score))     # same step: the better one (v6.1 m3)
 
     # --- plateau -------------------------------------------------------------------
     def _points(self, member=None):
@@ -109,7 +115,7 @@ class Selector:
         """How many of the most recent eval points, newest first, each beat the best of ALL earlier
         points by more than the paired SE; stops at the first that did not. 0 = the curve has
         stopped descending (or too few points)."""
-        ordered = self._points(member)
+        ordered = [c for c in self._points(member) if c.step > 0]   # the identity point is not an improvement to count (v6.1 m9)
         r = 0
         for i in range(len(ordered) - 1, 0, -1):
             b = min(ordered[:i], key=lambda c: c.screen.score)

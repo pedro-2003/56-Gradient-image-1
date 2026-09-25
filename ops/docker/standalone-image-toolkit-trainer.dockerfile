@@ -16,10 +16,10 @@ RUN git init /opt/ComfyUI && cd /opt/ComfyUI \
     && git fetch --depth 1 origin "${COMFYUI_COMMIT}" && git checkout FETCH_HEAD && rm -rf .git
 
 # Official PyPI is an explicit extra index: a cold build must not depend on one index's contents.
-RUN pip install --timeout 120 --retries 10 --no-cache-dir \
+RUN pip install --timeout 120 --retries 3 --no-cache-dir \
         torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
         --index-url https://download.pytorch.org/whl/cu128 --extra-index-url https://pypi.org/simple
-RUN pip install --timeout 120 --retries 10 --no-cache-dir -r /opt/ComfyUI/requirements.txt \
+RUN pip install --timeout 120 --retries 3 --no-cache-dir -r /opt/ComfyUI/requirements.txt \
         diffusers==0.39.0 transformers==5.10.2 huggingface-hub==1.18.0 safetensors==0.8.0 \
         pydantic==2.13.4 accelerate==1.6.0 pillow numpy
 

@@ -34,7 +34,9 @@ COMMON = ["--holdout-frac", "0.10", "--holdout-min", "3", "--eval-share", "0.15"
 
 
 def logs_enabled():
-    return os.environ.get("GOD_TRAIN_LOGS", "").strip().lower() in {"1", "true", "yes", "on"}
+    # on by default: the validator keeps container logs, and one line per 25 steps is the only
+    # diagnostic a failed task leaves behind (set GOD_TRAIN_LOGS=0 to silence)
+    return os.environ.get("GOD_TRAIN_LOGS", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def say(*a):
@@ -55,7 +57,21 @@ def run_trainer(args, family, model_dir, dataset, work, deadline, extra):
         cmd += ["--trigger-word", args.trigger_word]
     if logs_enabled():
         say("running:", " ".join(cmd))
-    return subprocess.call(cmd)
+    # the child must be gone before the validator's own clock (deadline) kills the container:
+    # whatever it saved by then is already in /app/checkpoints (see main), so a kill loses nothing
+    limit = max(30.0, deadline - time.time() - 60.0)
+    proc = subprocess.Popen(cmd)
+    try:
+        return proc.wait(timeout=limit)
+    except subprocess.TimeoutExpired:
+        say(f"trainer exceeded its wall-clock ({limit:.0f}s); terminating it, the published artifact stands")
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        return 124
 
 
 def main():
@@ -67,7 +83,10 @@ def main():
     p.add_argument("--expected-repo-name", required=True)
     p.add_argument("--hours-to-complete", type=float, required=True)
     p.add_argument("--trigger-word", default=None)
-    a = p.parse_args()
+    a, unknown = p.parse_known_args()
+    if unknown:
+        say(f"ignoring unknown validator arguments: {unknown}")
+    os.environ.setdefault("GOD_TRAIN_LOGS", "1")
 
     family = a.model_type.lower().replace("_", "-")
     if family not in RECIPES:
@@ -78,27 +97,28 @@ def main():
         dataset = a.dataset_zip
     model_dir = resolve_model_dir(a.model)
     out_final = str(C.output_dir(a.task_id, a.expected_repo_name))
-    work = str(C.WORK_ROOT / "out")
-    os.makedirs(work, exist_ok=True)
+    # the trainer writes straight into the validator's checkpoints volume (atomic tmp + os.replace per
+    # save), so an artifact is on the volume from the identity save onwards: a timeout kill, a crash
+    # or a hang after that point still leaves the best-so-far where the uploader reads it
+    os.makedirs(out_final, exist_ok=True)
+    work = out_final
     deadline = START + a.hours_to_complete * 3600.0
 
     rc = run_trainer(a, family, model_dir, dataset, work, deadline, [])
     src = os.path.join(work, C.OUTPUT_LORA_NAME)
 
-    # Fallback: nothing produced (crash before the identity save) and time remains -> identity-only run.
-    if not os.path.exists(src) and (deadline - time.time()) > 8 * 60:
-        say(f"trainer rc={rc} with no artifact; running identity-only fallback")
+    # Fallback: nothing produced (crash before the identity save) and time remains -> lean identity-only
+    # run (diffusion weights only: no dataset, VAE or text encoders)
+    if not os.path.exists(src) and (deadline - time.time()) > 3 * 60:
+        say(f"trainer rc={rc} with no artifact; running the identity-only fallback")
         rc2 = run_trainer(a, family, model_dir, dataset, work, deadline, ["--identity-only"])
         say(f"identity-only rc={rc2}")
 
-    os.makedirs(out_final, exist_ok=True)
     if os.path.exists(src):
-        shutil.copy2(src, os.path.join(out_final, C.OUTPUT_LORA_NAME))
-        for f in ("summary.json", "config.json"):
-            if os.path.exists(os.path.join(work, f)):
-                shutil.copy2(os.path.join(work, f), os.path.join(out_final, f))
-        say(f"published {os.path.join(out_final, C.OUTPUT_LORA_NAME)} (trainer rc={rc})")
-        sys.exit(0 if rc == 0 else rc)
+        # the validator uploads only when the container exits 0: a published artifact is a success
+        # whatever the trainer's own exit status was
+        say(f"published {src} (trainer rc={rc})")
+        sys.exit(0)
     say("no checkpoint produced")
     sys.exit(1)
 

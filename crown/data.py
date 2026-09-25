@@ -66,7 +66,17 @@ def load_items(source, trigger_word=None):
         cap = caption.strip() if caption and caption.strip() else (trigger_word or "")
         items.append({"name": name, "image": image, "caption": cap, "sha256": image_digest(image),
                       "aspect": image.size[0] / image.size[1], "cap_len": len(cap.split())})
-    return items
+    # identical images (same digest) would let one copy train while its twin sits in the holdout and
+    # would collide in the paired per-case keys: keep the first of each (v6.1 m12)
+    seen, unique = set(), []
+    for it in items:
+        if it["sha256"] in seen:
+            continue
+        seen.add(it["sha256"])
+        unique.append(it)
+    if len(unique) != len(items):
+        print(f"[data] {len(items) - len(unique)} duplicate image(s) dropped", flush=True)
+    return unique
 
 
 # --- holdout ------------------------------------------------------------------

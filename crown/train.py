@@ -91,7 +91,7 @@ def main(argv=None):
     if cfg.text_enc_dtype is None:
         cfg.text_enc_dtype = "bf16" if cfg.family == "qwen-image" else "fp16"
     os.makedirs(cfg.out, exist_ok=True)
-    json.dump(vars(cfg), open(os.path.join(cfg.out, "config.json"), "w"), indent=1)
+    json.dump(vars(cfg), open(os.path.join(cfg.out, "crown_config.json"), "w"), indent=1)   # not "config.json": HF tooling would read that as a model config
 
     from crown import comfy_boot, data, engine
     from crown.assets import Assets
@@ -106,6 +106,21 @@ def main(argv=None):
     import torch
 
     engine.log(f"family={cfg.family} budget {budget.remaining() / 60:.1f} min; device {mm.get_torch_device()}")
+
+    if cfg.identity_only:
+        # lean fallback (v6.1 B3): only the diffusion weights are needed to write a loadable identity
+        # LoRA; dataset, VAE and text encoders stay untouched so a failure there cannot repeat here
+        from crown.lora import Lora, save_lora, select_targets
+
+        assets = Assets(cfg.family, cfg.model_dir, cfg.baked_dir)
+        model = engine.load_diffusion_model(assets.diffusion_sd(), cfg.family)
+        targets = select_targets(model.model.diffusion_model, cfg.include, cfg.exclude) or select_targets(model.model.diffusion_model, None, None)
+        lora = Lora(targets, cfg.rank, cfg.alpha, mm.get_torch_device(), cfg.seed)
+        tmp = os.path.join(cfg.out, engine.C.OUTPUT_LORA_NAME + ".tmp")
+        save_lora(tmp, lora.state(), lora.scale, metadata={"crown": "identity-only"})
+        os.replace(tmp, os.path.join(cfg.out, engine.C.OUTPUT_LORA_NAME))
+        engine.log(f"identity-only artifact written ({len(targets)} targets)")
+        return
 
     items = data.load_items(cfg.dataset, cfg.trigger_word)
     hold = data.choose_holdout(items, cfg.holdout_frac, cfg.holdout_min)
@@ -171,10 +186,6 @@ def main(argv=None):
             engine.log(f"evaluator twin unavailable: {type(e).__name__}: {e}")
             twin = None
     trainer = engine.Trainer(cfg, model, items, raw_conds, cfg.out, budget, twin=twin)
-    if cfg.identity_only:
-        trainer.save(trainer.lora.state(), trainer.lora.scale, float("nan"), "identity-only")
-        engine.log("identity-only artifact written")
-        return
     guider = engine.make_guider(model, raw_conds[""])
     lat0 = items[0]["scaled"]
     guider.sample(torch.zeros_like(lat0), lat0, engine.TrainSampler(trainer), engine.evaluator_schedule(),
