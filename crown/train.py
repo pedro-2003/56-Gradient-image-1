@@ -69,6 +69,10 @@ def parse(argv=None):
     p.add_argument("--holdout-names", default="", help="comma-separated image names to hold out (overrides the stratified choice)")
     p.add_argument("--train-base", default="cache", choices=["cache", "evaluator", "requant"],
                    help="ideogram4: train on the cache's per-row fp8 base (dequantised) or on the evaluator's per-tensor file")
+    p.add_argument("--replan", action="store_true",
+                   help="after member 0's best step s* is known, train further members on ALL images for s* steps "
+                        "(annealed, blind) with the time left and ship the soup when member 0's curve is well-formed")
+    p.add_argument("--replan-max-members", type=int, default=3, help="at most this many blind members")
     p.add_argument("--band-power", type=float, default=0.0,
                    help="0 = uniform over sigma bands (like the score); p>0 repeats band b (loss_b/median)^p times per pass, "
                         "loss_b being the latest holdout per-band loss - importance sampling toward where the score mass is")

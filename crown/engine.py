@@ -337,6 +337,8 @@ class Trainer:
                                             "score": m_best.score, "plateau_exit": plateau_exit})
             # phase 2: the member returned early because its holdout plateaued and the
             # remaining budget can plausibly carry a fresh member to a comparable optimum
+            if getattr(cfg, "replan", False):
+                break                                   # the replan spends the rest on blind members
             if not plateau_exit or member + 1 >= cfg.max_members:
                 break
             member += 1
@@ -348,6 +350,12 @@ class Trainer:
             self._screen(guider, extra, sc)
             self.selector.add(sc)
 
+        # optimum-aware replan: with s* known, spend what is left on blind members trained on ALL
+        # images for s* steps and ship their soup with member 0's best (strategy v5 section 6)
+        replan_soup = None
+        if getattr(cfg, "replan", False):
+            replan_soup = self._replan(guider, extra, members)
+
         # confirm the top candidates with more noise draws (the evaluator's own draws 0..k-1) —
         # through the evaluator twin where numerics differ — then 1-SE pick
         top = self.selector.top(self._confirm_count())
@@ -356,6 +364,9 @@ class Trainer:
                 break
             self._confirm(guider, extra, c)
         picked = self.selector.pick(use_confirm=any(c.confirm is not None for c in top)) or self.best
+        if replan_soup is not None:
+            picked = replan_soup
+            log(f"replan: shipping {replan_soup.tag} (blind members on all images) over {picked.tag if picked is not replan_soup else 'the 1-SE pick'}")
         # never ship something the evaluator cannot load: check the final state on the real loader path
         ok, missing = verify_loadable(self.model, {n: (u.to(self.device), d.to(self.device)) for n, (u, d) in picked.state.items()}, picked.scale)
         self.summary["final_loadable"] = {"ok": ok, "missing": missing[:5]}
@@ -528,6 +539,130 @@ class Trainer:
             self.summary["band_repeats"] = reps
             log(f"band repeats (power {power}): {reps}")
         return reps
+
+    def _well_formed(self, m0):
+        """Member 0's curve supports a blind replan: a confirmed-interior optimum (a later screened
+        point exists and is worse than the best by more than the paired SE) at a non-trivial step."""
+        if m0.member != 0 or m0.step < 50 or m0.screen is None:
+            return False
+        later = [c for c in self.selector.cands if c.member == 0 and c.screen is not None and c.step > m0.step]
+        if not later:
+            return False
+        worse = 0
+        for c in later:
+            mean, se, n = c.screen.paired_diff(m0.screen)
+            if n > 1 and mean > se:
+                worse += 1
+        return worse >= 1
+
+    def _replan(self, guider, extra, members):
+        cfg, budget = self.cfg, self.budget
+        m0 = members[0]
+        if not self._well_formed(m0):
+            log("replan: member 0's curve is not well-formed (no confirmed interior optimum); skipped")
+            self.summary["replan"] = {"skipped": "not well-formed"}
+            return None
+        n_all, n_train = len(self.items), len(self.train_items)
+        steps = int(math.ceil(m0.step * n_all / n_train))
+        reserve = budget.est_eval(cfg.confirm_noises) * 2 + budget.est_eval() * 2 + 60
+        per_member = steps * budget.est_step() + 10
+        k = int((budget.remaining() - reserve) // per_member)
+        k = max(0, min(int(getattr(cfg, "replan_max_members", 3)), k))
+        if k < 1:
+            log(f"replan: no room for a blind member ({steps} steps = {per_member:.0f}s, {budget.remaining():.0f}s left)")
+            self.summary["replan"] = {"skipped": "no room", "steps": steps, "left_s": budget.remaining()}
+            return None
+        log(f"replan: s*={m0.step} -> {steps} steps on all {n_all} images x {k} blind members ({per_member:.0f}s each, {budget.remaining():.0f}s left)")
+        states = [m.state for m in members]          # every holdout-selected best, then the blind ones
+        for j in range(k):
+            member = 100 + j                     # blind members are numbered from 100
+            self.lora.reinit(cfg.seed + 1000 * member)
+            st = self._train_fixed(guider, extra, member, steps)
+            if st is None:
+                break
+            states.append(st)
+            if not budget.fits(per_member + reserve):
+                break
+        if len(states) < 2:
+            self.summary["replan"] = {"skipped": "no member finished", "steps": steps}
+            return None
+        soup = Candidate("replan-soup", self.summary["steps"], soup_state(states), self.lora.scale, member=-2)
+        # sanity screen on the holdout (contaminated for the blind members, so optimistic): a soup that
+        # still regresses against member 0's best is broken and must not ship
+        self._screen(guider, extra, soup)
+        self.selector.add(soup)
+        mean, se, n = soup.screen.paired_diff(m0.screen)
+        ok = not (n > 1 and mean > se)
+        self.summary["replan"] = {"s_star": m0.step, "steps": steps, "members": len(states) - 1, "soup_screen": soup.score,
+                                  "m0_screen": m0.screen.score, "ship": ok}
+        log(f"replan: soup of {len(states)} states screens {soup.score:.6f} vs member-0 best {m0.screen.score:.6f} -> {'ship' if ok else 'REJECTED'}")
+        return soup if ok else None
+
+    def _train_fixed(self, guider, extra, member, steps):
+        """Blind member: exactly `steps` steps on ALL images, cosine annealed over those steps, EMA
+        state returned; no screens. Stops early (returns None) only on the budget or a second OOM."""
+        cfg, lora, budget = self.cfg, self.lora, self.budget
+        groups = [{"params": lora.up_params, "lr_mult": cfg.lora_plus_ratio}, {"params": lora.down_params, "lr_mult": 1.0}]
+        opt = torch.optim.AdamW(groups, lr=cfg.lr, betas=(0.9, 0.99), weight_decay=cfg.weight_decay, eps=1e-8)
+        ema = [p.detach().clone() for p in lora.params] if cfg.ema > 0 else None
+        gen = torch.Generator(device="cpu").manual_seed(cfg.seed + 7919 * member)
+        items = self.items
+        cases = []
+        step = 0
+        t_start = time.time()
+        while step < steps:
+            if not budget.fits(budget.est_step() + budget.est_eval(cfg.confirm_noises) * 2 + 60):
+                log(f"m{member} (blind) stopped at step {step}/{steps}: budget")
+                return None
+            p = step / max(1, steps)
+            warm = min(1.0, (step + 1) / max(1, cfg.warmup_steps))
+            lr = cfg.lr * warm * (cfg.lr_final_frac + (1 - cfg.lr_final_frac) * 0.5 * (1 + math.cos(math.pi * p)))
+            for g in opt.param_groups:
+                g["lr"] = lr * g["lr_mult"]
+            if not cases:
+                reps = self._band_repeats()
+                cases = [(i, b) for i in range(len(items)) for b in range(C.EVAL_STRATA) for _ in range(reps[b])]
+                self.rng.shuffle(cases)
+            i, band = cases.pop()
+            item = items[i]
+            sigma = sigma_of(band)
+            noise = torch.randn(item["scaled"].shape, generator=gen, dtype=torch.float32).to(self.device)
+            prompt = item["caption"] if (self.summary["steps"] % 2 == 0) else ""
+            ts = time.time()
+            try:
+                with torch.enable_grad():
+                    noisy, target = make_noisy(item["scaled"], noise, sigma)
+                    den = self._forward(guider, extra, prompt, item, noisy, sigma)
+                    loss = flow_prediction_mse(noisy, den, target, sigma).mean()
+                    loss.backward()
+                torch.nn.utils.clip_grad_norm_(lora.params, cfg.grad_clip)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+            except torch.OutOfMemoryError:
+                opt.zero_grad(set_to_none=True)
+                noisy = den = loss = None
+                torch.cuda.empty_cache()
+                self.summary["oom"] = self.summary.get("oom", 0) + 1
+                if not self._ckpt_on:
+                    enable_checkpointing(self.model.model.diffusion_model, stride=1)
+                    self._ckpt_on = True
+                    cases.append((i, band))
+                    log(f"m{member} (blind) OOM at step {step}: gradient checkpointing enabled, retrying ({self._mem()})")
+                    continue
+                log(f"m{member} (blind) OOM again at step {step}: member abandoned ({self._mem()})")
+                return None
+            if ema is not None:
+                with torch.no_grad():
+                    for e, q in zip(ema, lora.params):
+                        e.mul_(cfg.ema).add_(q.detach(), alpha=1 - cfg.ema)
+            budget.observe_step(time.time() - ts)
+            step += 1
+            self.summary["steps"] += 1
+            if step % 100 == 0 or step == steps:
+                log(f"m{member} (blind, all {len(items)} imgs) step {step}/{steps} loss {loss.item():.4f} lr {lr:.2e} {self._mem()} {time.time() - t_start:.0f}s")
+        if ema is not None:
+            return {n: (t[0].detach().cpu().clone(), t[1].detach().cpu().clone()) for n, t in lora.state_from_flat([e.clone() for e in ema]).items()}
+        return {n: (u.detach().cpu().clone(), d.detach().cpu().clone()) for n, (u, d) in lora.state().items()}
 
     def _screen_candidates(self, guider, extra, member, step, ema, raw_hist, m_best, avg_only=False, tag_prefix="", final=False):
         lora = self.lora

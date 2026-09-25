@@ -117,6 +117,7 @@ def main():
     ap.add_argument("--polish", action="store_true")
     ap.add_argument("--plateau-window", type=int, default=3)
     ap.add_argument("--screen-ema-only", action="store_true")
+    ap.add_argument("--replan", action="store_true")
     a = ap.parse_args()
     torch.manual_seed(0)
     Cc, H, W = 4, 8, 8
@@ -139,7 +140,7 @@ def main():
         lr=3e-3, lr_final_frac=0.1, warmup_steps=5, weight_decay=0.0, grad_clip=1.0, lora_plus_ratio=1.0, ema=0.99,
         eval_share=0.25, confirm_top=3, confirm_noises=4, phase2=True, max_members=a.max_members,
         polish=a.polish, polish_lr_frac=0.3, band_power=0.0, plateau_window=a.plateau_window, screen_ema_only=a.screen_ema_only,
-        empty_prompt_frac=0.5, select_metric="mean", eval_every=0, holdout_names="")
+        empty_prompt_frac=0.5, select_metric="mean", eval_every=0, holdout_names="", replan=a.replan, replan_max_members=3)
     budget = Budget(time.time() + a.seconds, kill_margin_s=0.0, publish_reserve_s=2.0)
     os.makedirs(a.out, exist_ok=True)
     os.environ["GOD_TRAIN_LOGS"] = "1"
