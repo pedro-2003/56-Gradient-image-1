@@ -115,23 +115,27 @@ def run(tr, guider, extra):
 # --- checks ------------------------------------------------------------------------
 
 def identity_first():
+    import crown.scoring as scoring
     tr, guider, extra, out, _ = build(seconds=20)
-    orig = tr.scorer.score
+    orig = scoring.HoldoutScorer.score
 
     def boom(*a, **k):
         raise RuntimeError("first forward exploded")
-    tr.scorer.score = boom
+    scoring.HoldoutScorer.score = boom
     try:
         tr.run(guider, extra)
         raise AssertionError("run should have raised")
     except RuntimeError:
         pass
+    finally:
+        scoring.HoldoutScorer.score = orig
     assert os.path.exists(os.path.join(out, "last.safetensors")), "no artifact before the first screen"
-    tr.scorer.score = orig
 
 
 def restore_on_error():
+    from crown.scoring import HoldoutScorer
     tr, guider, extra, out, _ = build(seconds=20)
+    tr.scorer = HoldoutScorer(tr.holdout_items, None, tr.device)     # run() would build it; we screen directly
     orig = tr.scorer.score
 
     def boom(*a, **k):
@@ -182,15 +186,23 @@ def nonfinite_skip():
 
 def unloadable_veto():
     tr, guider, extra, out, tw = build(seconds=40)
-    # veto whatever the twin is asked to confirm first: it must not be shipped
-    seen = {}
+    # veto the first candidate the CONFIRM stage sends to the twin (the parity call is not a confirm)
+    state = {"armed": False, "done": False}
+    orig_confirm = tr._confirm
 
-    def veto(state):
-        key = id(state)
-        if not seen:
-            seen[key] = True
+    def confirm(g, e, c):
+        state["armed"] = not state["done"]
+        try:
+            return orig_confirm(g, e, c)
+        finally:
+            state["armed"] = False
+    tr._confirm = confirm
+
+    def veto(st):
+        if state["armed"] and not state["done"]:
+            state["done"] = True
             return True
-        return key in seen
+        return False
     tw.veto_current = veto
     s = run(tr, guider, extra)
     vetoed = s.get("twin_unloadable") or []
