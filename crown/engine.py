@@ -158,14 +158,8 @@ class Trainer:
         self.cfg, self.model, self.items, self.raw_conds, self.out_dir, self.budget = cfg, model, items, raw_conds, out_dir, budget
         self.twin = twin   # EvaluatorTwin or None: evaluator-exact scoring for the confirm stage
         self.device = model.load_device
-        # --oracle-train-all (dev only): train on EVERY image including the holdout, so the holdout score
-        # becomes the ceiling any data/prior lever could reach on these images (generalisation gap = this
-        # minus the clean run). Never on the validator.
-        oracle = bool(getattr(cfg, "oracle_train_all", False))
-        self.train_items = list(items) if oracle else [i for i in items if not i["holdout"]]
+        self.train_items = [i for i in items if not i["holdout"]]
         self.holdout_items = [i for i in items if i["holdout"]]
-        if oracle:
-            log(f"ORACLE: training on all {len(self.train_items)} images including the {len(self.holdout_items)} holdout images")
         if not self.train_items or not self.holdout_items:
             raise ValueError("need at least one training and one holdout image")
         self.rng = random.Random(cfg.seed)
@@ -176,13 +170,6 @@ class Trainer:
         if not targets:
             raise ValueError("LoRA include/exclude selected no Linear layers")
         self.lora = Lora(targets, cfg.rank, cfg.alpha, self.device, cfg.seed)
-        self.prior_loaded = False
-        init_path = getattr(cfg, "init_lora", "") or ""
-        if init_path:
-            ok, msg = self.lora.init_from_file(init_path)
-            self.prior_loaded = ok
-            self.summary["init_lora"] = {"path": init_path, "loaded": ok, "detail": msg}
-            log(f"[init] {'prior loaded' if ok else 'fallback: prior ignored, cold start'}: {msg}")
         self.lora.attach(model)
         self._ckpt_on = bool(cfg.ckpt)
         if cfg.ckpt:
@@ -379,18 +366,8 @@ class Trainer:
         self.base_score = None
         self.best = ident
         self.save(ident.state, ident.scale, float("nan"), "identity")
-        if self.prior_loaded:
-            # with a warm start the step-0 state is the prior, not the base: score the true base too so
-            # every "vs base" number keeps its meaning and the prior's own effect is visible at once
-            zero = {n: (torch.zeros_like(u), d) for n, (u, d) in ident.state.items()}
-            true_base = self._screen(guider, extra, Candidate("base", 0, zero, self.lora.scale))
-            self.base_score = true_base.score
-            base = self._screen(guider, extra, ident)
-            self.summary["prior_score"] = base.score
-            log(f"[init] prior at step 0: {base.score:.6f} vs true base {true_base.score:.6f} ({(base.score / true_base.score - 1) * 100:+.2f}%)")
-        else:
-            base = self._screen(guider, extra, ident)
-            self.base_score = base.score
+        base = self._screen(guider, extra, ident)
+        self.base_score = base.score
         self.summary["base_score"] = self.base_score
         self.summary["base_per_band"] = self._per_band(base)
         self.selector.add(ident)

@@ -68,35 +68,7 @@ class Lora:
         self.shapes = [(name, tuple(m.weight.shape)) for name, m in targets]
         self.names = [n for n, _ in self.shapes]
         self.wrappers = {n: LoraWrapper(self.scale) for n in self.names}
-        self._init = None          # warm-start state (architecture v6 L1); every reinit starts from it
         self.reinit(seed)
-
-    def init_from_file(self, path):
-        """Warm start from a LoRA file in our export layout. Fail-safe: every target must be present
-        with the same rank and shapes, else nothing changes and (False, reason) is returned."""
-        try:
-            sd = load_file(str(path), device="cpu")
-        except Exception as e:  # noqa: BLE001
-            return False, f"cannot read {path}: {e}"
-        st = {}
-        for name, (out_f, in_f) in self.shapes:
-            k = f"diffusion_model.{name}"
-            up, down = sd.get(f"{k}.lora_up.weight"), sd.get(f"{k}.lora_down.weight")
-            if up is None or down is None:
-                return False, f"target {name} missing in {path}"
-            if tuple(up.shape) != (out_f, self.rank) or tuple(down.shape) != (self.rank, in_f):
-                return False, f"shape mismatch at {name}: up {tuple(up.shape)} down {tuple(down.shape)} vs rank {self.rank}"
-            alpha = sd.get(f"{k}.alpha")
-            up = up.float()
-            if alpha is not None:                  # the file's own scale, re-expressed under this run's scale (v6.1 F6)
-                file_scale = float(alpha) / down.shape[0]
-                if abs(file_scale - self.scale) > 1e-9:
-                    up = up * (file_scale / self.scale)
-            st[name] = (up, down.float())
-        extra = sum(1 for k in sd if k.endswith(".lora_up.weight")) - len(st)
-        self._init = st
-        self.load_state(st)
-        return True, f"{len(st)} targets from {path}" + (f" ({extra} extra targets in the file ignored)" if extra else "")
 
     def reinit(self, seed: int):
         g = torch.Generator(device="cpu").manual_seed(seed)
@@ -109,8 +81,6 @@ class Lora:
             self.down_params.append(down)
             w = self.wrappers[name]
             w.up, w.down, w.scale, w.enabled = up, down, self.scale, True
-        if getattr(self, "_init", None) is not None:
-            self.load_state(self._init)
 
     def attach(self, patcher):
         for name, w in self.wrappers.items():

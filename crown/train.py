@@ -69,7 +69,6 @@ def parse(argv=None):
     p.add_argument("--holdout-names", default="", help="comma-separated image names to hold out (overrides the stratified choice)")
     p.add_argument("--train-base", default="cache", choices=["cache", "evaluator", "requant"],
                    help="ideogram4: train on the cache's per-row fp8 base (dequantised) or on the evaluator's per-tensor file")
-    p.add_argument("--init-lora", default="", help="warm start every member from this LoRA file (architecture v6 L1); ignored with a log line on mismatch")
     p.add_argument("--flip", action="store_true", help="train on a horizontally flipped twin of every training image as well (architecture v6 L3)")
     p.add_argument("--replan", action="store_true",
                    help="after member 0's best step s* is known, train further members on ALL images for s* steps "
@@ -78,7 +77,6 @@ def parse(argv=None):
     p.add_argument("--screen-passes", default="", help="screen schedule in passes over the (image, band) cases, e.g. 0.5,1,1.5,2")
     p.add_argument("--screen-max-share", type=float, default=0.30, help="cap on the wall-clock share of screens under --screen-passes")
     p.add_argument("--seed2", action="store_true", help="after the plateau: a clean second seed for s* steps + soup (v7)")
-    p.add_argument("--oracle-train-all", action="store_true", help="DEV ONLY: train on the holdout images too (ceiling measurement)")
     p.add_argument("--adaptive-cadence", action="store_true",
                    help="space screens out while the holdout curve is still descending (late-optimum families)")
     p.add_argument("--band-power", type=float, default=0.0,
