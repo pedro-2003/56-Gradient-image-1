@@ -484,7 +484,12 @@ class Trainer:
             # reach a comparable optimum (time-to-best of this member, plus its evals) in the time left
             want_phase2 = cfg.phase2 and member + 1 < cfg.max_members
             want_polish = getattr(cfg, "polish", False) and not polishing
-            plateau = (want_phase2 or want_polish or polishing) and self.selector.plateaued(window=getattr(cfg, "plateau_window", 3), member=member)
+            # v6.2: a curve whose best is its first or second real point has already peaked (flux: optimum
+            # at 6 min of 45, plateau declared at 27 min under a 3-point window) -> two points suffice
+            win = getattr(cfg, "plateau_window", 3)
+            if 0 <= self.selector.best_point_index(member) <= 1:
+                win = min(win, 2)
+            plateau = (want_phase2 or want_polish or polishing) and self.selector.plateaued(window=win, member=member)
             mb = m_best or self.best
             if polishing and pol_points >= 3 and plateau:
                 # the anneal has converged too: hand the rest to the confirm stage
@@ -647,7 +652,7 @@ class Trainer:
             return None
         n_all, n_train = len(self.items), len(self.train_items)
         steps = int(math.ceil(m0.step * n_all / n_train))
-        reserve = budget.est_eval(cfg.confirm_noises) * 2 + budget.est_eval() * 2 + 60
+        reserve = budget.est_eval(cfg.confirm_noises) + budget.est_eval() * 2 + 60   # one soup confirm + probe/soup screens (v6.2)
         per_member = steps * budget.est_step() + 10
         k = int((budget.remaining() - reserve) // per_member)
         k = max(0, min(int(getattr(cfg, "replan_max_members", 3)), k))

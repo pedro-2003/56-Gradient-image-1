@@ -126,6 +126,14 @@ class Selector:
                 break
         return r
 
+    def best_point_index(self, member=None) -> int:
+        """Index (0-based, step order, identity excluded) of the best screened eval point of this member;
+        -1 when there are no real points yet."""
+        ordered = [c for c in self._points(member) if c.step > 0]
+        if not ordered:
+            return -1
+        return min(range(len(ordered)), key=lambda i: ordered[i].screen.score)
+
     def plateaued(self, window: int = 3, member=None) -> bool:
         """True when the last `window` eval POINTS (a point = all candidates screened at one step of
         one member) each failed to beat the running best of the earlier points by more than the
