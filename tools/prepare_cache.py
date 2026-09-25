@@ -13,10 +13,38 @@ gated repos (krea/Krea-2-Raw, FLUX), an HF token in HF_TOKEN.
 import argparse
 import json
 import os
+import re
 import zipfile
 from pathlib import Path
 
 TEXT_ENCODER_REPO = {"ideogram4": "Qwen/Qwen3-VL-8B-Instruct", "krea2": "Qwen/Qwen3-VL-4B-Instruct"}
+
+# trainer/containers/downloader.py (G.O.D): a FLUX repo with exactly one root .safetensors, no
+# model_index.json, no diffusers component dirs, no weight index and no sharding is downloaded as
+# that single file only; everything else is a full snapshot.
+DIFFUSERS_COMPONENT_DIRS = {"scheduler", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2", "transformer", "unet", "vae"}
+WEIGHT_INDEX_SUFFIXES = (".bin.index.json", ".safetensors.index.json")
+SHARDED_RE = re.compile(r"-[0-9]{5}-of-[0-9]{5}[.]safetensors$")
+
+
+def standalone_flux_checkpoint(repo_id: str, model_type: str, token=None):
+    """The single root file the validator would keep for this flux repo, or None (full snapshot)."""
+    if model_type != "flux":
+        return None
+    from huggingface_hub import HfApi
+    files = [f.rfilename for f in HfApi().model_info(repo_id, token=token, files_metadata=False).siblings]
+    roots = [f for f in files if "/" not in f and f.endswith(".safetensors")]
+    if len(roots) != 1:
+        return None
+    if "model_index.json" in files:
+        return None
+    if any(f.split("/")[0] in DIFFUSERS_COMPONENT_DIRS for f in files if "/" in f):
+        return None
+    if any(f.endswith(WEIGHT_INDEX_SUFFIXES) for f in files):
+        return None
+    if SHARDED_RE.search(roots[0]):
+        return None
+    return roots[0]
 
 
 def make_task_zip(task_dir: Path, task_id: str, out: Path):
@@ -51,8 +79,18 @@ def main():
 
     token = os.environ.get("HF_TOKEN")
     mdir = cache / "models" / a.model.replace("/", "--")
-    print("downloading base model", a.model, "->", mdir)
-    snapshot_download(repo_id=a.model, repo_type="model", local_dir=str(mdir), token=token)
+    single = standalone_flux_checkpoint(a.model, a.model_type, token)
+    if single:
+        from huggingface_hub import hf_hub_download
+        print("standalone FLUX checkpoint (validator rule): downloading only", single, "->", mdir)
+        mdir.mkdir(parents=True, exist_ok=True)
+        hf_hub_download(repo_id=a.model, filename=single, local_dir=str(mdir), token=token)
+        for f in mdir.iterdir():   # the validator normalises the cache to that one file
+            if f.name != single and (f.is_file() or f.is_symlink()):
+                f.unlink()
+    else:
+        print("downloading base model", a.model, "->", mdir)
+        snapshot_download(repo_id=a.model, repo_type="model", local_dir=str(mdir), token=token)
     te = TEXT_ENCODER_REPO.get(a.model_type)
     if te:
         tdir = cache / "hf_cache" / te.replace("/", "--")
