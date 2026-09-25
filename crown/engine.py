@@ -290,14 +290,25 @@ class Trainer:
             return 1                                  # ema only at intermediate points
         return 2 if self.cfg.ema > 0 else 1          # raw (+ ema); avg2 only at member end
 
-    def _eval_every(self):
-        """Steps between eval points so that screening takes ~cfg.eval_share of wall-clock."""
+    def _eval_every(self, member=None):
+        """Steps between eval points so that screening takes ~cfg.eval_share of wall-clock. With
+        --adaptive-cadence the interval widens while the curve is still descending (x1.5, x2, x2.5,
+        cap x3 after 1, 2, 3, 4+ consecutive real improvements) and snaps back when it stops."""
         fixed = int(getattr(self.cfg, "eval_every", 0) or 0)
         if fixed > 0:
-            return fixed
-        share = self.cfg.eval_share
-        cost = self.budget.est_eval() * self._screens_per_point()
-        return max(50, int(math.ceil(cost * (1 - share) / (share * self.budget.est_step()))))
+            base = fixed
+        else:
+            share = self.cfg.eval_share
+            cost = self.budget.est_eval() * self._screens_per_point()
+            base = max(50, int(math.ceil(cost * (1 - share) / (share * self.budget.est_step()))))
+        if not getattr(self.cfg, "adaptive_cadence", False):
+            return base
+        r = self.selector.trailing_improvements(member)
+        factor = min(3.0, 1.0 + 0.5 * r)
+        if factor != getattr(self, "_cadence_factor", 1.0):
+            self._cadence_factor = factor
+            log(f"cadence: {r} consecutive improvements -> screens every {int(base * factor)} steps (x{factor:.1f})")
+        return int(base * factor)
 
     # --- run -----------------------------------------------------------------------
     def run(self, guider, extra):
@@ -423,7 +434,7 @@ class Trainer:
         peak, warm_base, polishing, tag_prefix, pol_points = cfg.lr, 0, False, "", 0
         while True:
             now = time.time()
-            due = (step - last_eval) >= self._eval_every()
+            due = (step - last_eval) >= self._eval_every(member)
             need = budget.est_step() + (budget.est_eval() * (self._screens_per_point() + 0.2) + 5 if due else 0)
             if now + need > horizon_end or not budget.fits(need):
                 break

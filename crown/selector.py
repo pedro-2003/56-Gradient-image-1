@@ -95,18 +95,37 @@ class Selector:
         return min(within, key=lambda c: c.step)
 
     # --- plateau -------------------------------------------------------------------
-    def plateaued(self, window: int = 3, member=None) -> bool:
-        """True when the last `window` eval POINTS (a point = all candidates screened at one step of
-        one member) each failed to beat the running best of the earlier points by more than the
-        paired SE of that comparison. Counting points, not candidates, keeps raw/ema pairs from
-        making a two-point window look like three."""
+    def _points(self, member=None):
+        """Eval POINTS in step order: the best-screened candidate at each (member, step)."""
         screened = [c for c in self.cands if c.screen is not None and (member is None or c.member == member)]
         points = {}
         for c in screened:
             key = (c.member, c.step)
             if key not in points or c.screen.score < points[key].screen.score:
                 points[key] = c
-        ordered = [points[k] for k in sorted(points)]
+        return [points[k] for k in sorted(points)]
+
+    def trailing_improvements(self, member=None) -> int:
+        """How many of the most recent eval points, newest first, each beat the best of ALL earlier
+        points by more than the paired SE; stops at the first that did not. 0 = the curve has
+        stopped descending (or too few points)."""
+        ordered = self._points(member)
+        r = 0
+        for i in range(len(ordered) - 1, 0, -1):
+            b = min(ordered[:i], key=lambda c: c.screen.score)
+            mean, se, n = ordered[i].screen.paired_diff(b.screen)
+            if n > 1 and mean < -se:
+                r += 1
+            else:
+                break
+        return r
+
+    def plateaued(self, window: int = 3, member=None) -> bool:
+        """True when the last `window` eval POINTS (a point = all candidates screened at one step of
+        one member) each failed to beat the running best of the earlier points by more than the
+        paired SE of that comparison. Counting points, not candidates, keeps raw/ema pairs from
+        making a two-point window look like three."""
+        ordered = self._points(member)
         if len(ordered) < window + 1:
             return False
         recent, earlier = ordered[-window:], ordered[:-window]

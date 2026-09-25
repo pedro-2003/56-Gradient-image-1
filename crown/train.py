@@ -75,6 +75,8 @@ def parse(argv=None):
                    help="after member 0's best step s* is known, train further members on ALL images for s* steps "
                         "(annealed, blind) with the time left and ship the soup when member 0's curve is well-formed")
     p.add_argument("--replan-max-members", type=int, default=3, help="at most this many blind members")
+    p.add_argument("--adaptive-cadence", action="store_true",
+                   help="space screens out while the holdout curve is still descending (late-optimum families)")
     p.add_argument("--band-power", type=float, default=0.0,
                    help="0 = uniform over sigma bands (like the score); p>0 repeats band b (loss_b/median)^p times per pass, "
                         "loss_b being the latest holdout per-band loss - importance sampling toward where the score mass is")
