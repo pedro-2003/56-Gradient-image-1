@@ -27,9 +27,14 @@ def main():
     p.add_argument("--out", required=True, help="the paired cache root to create")
     p.add_argument("--holdout-frac", type=float, default=0.2)
     p.add_argument("--holdout-min", type=int, default=5)
+    p.add_argument("--max-pairs", type=int, default=0,
+                   help="round-1 regime: keep only this many image/caption pairs (deterministic by digest) before the split")
     a = p.parse_args()
 
     items = data.load_items(a.dataset_dir)
+    if a.max_pairs and len(items) > a.max_pairs:
+        items = sorted(items, key=lambda it: it["sha256"])[: a.max_pairs]
+        print(f"max-pairs {a.max_pairs}: kept {len(items)} of the dataset's pairs (by digest order)")
     hold = set(data.choose_holdout(items, a.holdout_frac, a.holdout_min))
     names_h = [items[i]["name"] for i in sorted(hold)]
     names_t = [it["name"] for i, it in enumerate(items) if i not in hold]
