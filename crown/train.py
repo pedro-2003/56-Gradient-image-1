@@ -69,6 +69,8 @@ def parse(argv=None):
     p.add_argument("--holdout-names", default="", help="comma-separated image names to hold out (overrides the stratified choice)")
     p.add_argument("--train-base", default="cache", choices=["cache", "evaluator", "requant"],
                    help="ideogram4: train on the cache's per-row fp8 base (dequantised) or on the evaluator's per-tensor file")
+    p.add_argument("--init-lora", default="", help="warm start every member from this LoRA file (architecture v6 L1); ignored with a log line on mismatch")
+    p.add_argument("--flip", action="store_true", help="train on a horizontally flipped twin of every training image as well (architecture v6 L3)")
     p.add_argument("--replan", action="store_true",
                    help="after member 0's best step s* is known, train further members on ALL images for s* steps "
                         "(annealed, blind) with the time left and ship the soup when member 0's curve is well-formed")
@@ -125,6 +127,11 @@ def main(argv=None):
     enc = engine.LatentEncoder(kind, payload)
     for it in items:
         it["latent"] = enc.encode(it["image"])
+    if getattr(cfg, "flip", False):
+        twins = data.add_flips(items, enc.encode)
+        items.extend(twins)
+        engine.log(f"flip: {len(twins)} flipped training twins added (holdout untouched)")
+    for it in items:
         it["image"] = None
     enc.free()
     engine.log(f"latents ({kind}) in {time.time() - t:.0f}s; shape {tuple(items[0]['latent'].shape)}")

@@ -78,6 +78,21 @@ def _strata_key(item):
     return shape
 
 
+def add_flips(items, encode):
+    """Architecture v6 L3: a horizontally flipped twin of every TRAINING image (holdout images are
+    scored as they are). `encode(image) -> latent`; the twin carries the caption and a distinct
+    digest. Returns the twins (the caller appends them)."""
+    from PIL import ImageOps
+    twins = []
+    for it in items:
+        if it.get("holdout") or it.get("image") is None:
+            continue
+        twins.append({"name": it["name"] + "#flip", "image": None, "caption": it["caption"],
+                      "sha256": it["sha256"][:-1] + "f", "holdout": False, "flip_of": it["name"],
+                      "latent": encode(ImageOps.mirror(it["image"]))})
+    return twins
+
+
 def choose_holdout(items, frac=C.TEST_SPLIT_FRACTION, minimum=3):
     """Stratified holdout that mirrors the evaluator's own split size.
 
