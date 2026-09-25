@@ -190,18 +190,21 @@ class Assets:
         if f == "z-image":
             return "diffusers", os.path.join(self.model_dir, "vae")
         if f == "flux":
-            ae = os.path.join(self.model_dir, C.FLUX_VAE_FILE)   # the evaluator's rayonlabs/FLUX.1-dev/ae.safetensors
+            # the evaluator ALWAYS encodes with rayonlabs/FLUX.1-dev/ae.safetensors (image_flow_adapter.py),
+            # whatever the task repo ships: the baked copy of that file comes first, the repo's own
+            # ae.safetensors (rayonlabs itself) second; an embedded VAE is a last resort only
+            baked = os.path.join(self.baked_dir, C.FLUX_VAE_FILE)
+            if os.path.exists(baked):
+                _note("vae: baked rayonlabs ae.safetensors (the evaluator's)")
+                return "comfy", load_file(baked, device="cpu")
+            ae = os.path.join(self.model_dir, C.FLUX_VAE_FILE)
             if os.path.exists(ae):
                 _note("vae: repo ae.safetensors")
                 return "comfy", load_file(ae, device="cpu")
             embedded = sub_dict(self._full_checkpoint(), "vae.")
             if embedded:
-                _note("fallback: vae embedded in the checkpoint")
+                _note("fallback: vae embedded in the checkpoint (evaluator uses rayonlabs ae)")
                 return "comfy", embedded
-            baked = os.path.join(self.baked_dir, C.FLUX_VAE_FILE)   # task repos (e.g. PixelWave) ship no ae.safetensors
-            if os.path.exists(baked):
-                _note("vae: baked ae.safetensors (repo ships none)")
-                return "comfy", load_file(baked, device="cpu")
             dvae = os.path.join(self.model_dir, "vae")               # last resort: the repo's diffusers AutoencoderKL
             if os.path.isdir(dvae) and os.path.exists(os.path.join(dvae, "config.json")):
                 _note("fallback: vae from the repo's diffusers vae/ (evaluator parity not guaranteed)")
