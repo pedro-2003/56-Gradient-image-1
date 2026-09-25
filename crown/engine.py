@@ -535,7 +535,7 @@ class Trainer:
             if plateau and member == 0 and getattr(cfg, "seed2", False) and mb.step > 0 and mb.member == 0:
                 # v7: exit only if a clean second seed of s* steps, its screen, the soup screen and one soup
                 # confirm fit; otherwise keep training member 0 (never leave dead time)
-                need_s2 = mb.step * budget.est_step() + 2 * budget.est_eval() + budget.est_eval(cfg.confirm_noises) * (1.5 if self.twin else 1.0) + 60
+                need_s2 = mb.step * budget.est_step() * 1.02 + self._seed2_reserve()
                 if budget.fits(need_s2) and self._well_formed(mb):
                     plateau_exit = True
                     log(f"m0 plateau at step {step} (best {mb.tag}@{mb.step}); seed2 for {mb.step} steps fits ({need_s2:.0f}s of {budget.remaining():.0f}s)")
@@ -682,13 +682,18 @@ class Trainer:
             log(f"band repeats (power {power}): {reps}")
         return reps
 
+    def _seed2_reserve(self):
+        """What must remain after the seed2 member: its screen, the soup screen, one confirm, verify + slack."""
+        b = self.budget
+        return 2 * b.est_eval() + b.est_eval(self.cfg.confirm_noises) * (1.5 if self.twin else 1.0) + 60
+
     def _seed2(self, guider, extra, m0):
         """v7: a clean second seed for exactly s* steps on the training images (annealed to s*), then the
         soup of it and member 0's best. Both are screened on the untouched holdout and join the selector;
         the confirm stage and the 1-SE rule decide what ships."""
         cfg, budget = self.cfg, self.budget
         self.lora.reinit(cfg.seed + 1000 * 1)
-        st = self._train_fixed(guider, extra, 1, m0.step, items=self.train_items)
+        st = self._train_fixed(guider, extra, 1, m0.step, items=self.train_items, reserve=self._seed2_reserve())
         if st is None or not budget.fits(2 * budget.est_eval() + 30):
             self.summary["seed2"] = {"skipped": "did not finish", "steps": m0.step}
             return
@@ -781,7 +786,7 @@ class Trainer:
         log(f"replan: soup of {len(states)} states screens {soup.score:.6f} vs member-0 best {m0.screen.score:.6f} -> {'ship' if ok else 'REJECTED'}")
         return soup if ok else None
 
-    def _train_fixed(self, guider, extra, member, steps, items=None):
+    def _train_fixed(self, guider, extra, member, steps, items=None, reserve=None):
         """Blind member: exactly `steps` steps on `items` (default ALL images), cosine annealed over
         those steps, EMA state returned; no screens. Stops early (returns None) only on the budget or a
         second OOM."""
@@ -795,7 +800,8 @@ class Trainer:
         step = 0
         t_start = time.time()
         while step < steps:
-            if not budget.fits(budget.est_step() + budget.est_eval(cfg.confirm_noises) * 2 + 60):
+            keep = reserve if reserve is not None else budget.est_eval(cfg.confirm_noises) * 2 + 60
+            if not budget.fits(budget.est_step() + keep):
                 log(f"m{member} (blind) stopped at step {step}/{steps}: budget")
                 return None
             p = step / max(1, steps)
