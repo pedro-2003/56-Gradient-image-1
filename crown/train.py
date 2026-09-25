@@ -75,6 +75,7 @@ def parse(argv=None):
                    help="after member 0's best step s* is known, train further members on ALL images for s* steps "
                         "(annealed, blind) with the time left and ship the soup when member 0's curve is well-formed")
     p.add_argument("--replan-max-members", type=int, default=3, help="at most this many blind members")
+    p.add_argument("--oracle-train-all", action="store_true", help="DEV ONLY: train on the holdout images too (ceiling measurement)")
     p.add_argument("--adaptive-cadence", action="store_true",
                    help="space screens out while the holdout curve is still descending (late-optimum families)")
     p.add_argument("--band-power", type=float, default=0.0,

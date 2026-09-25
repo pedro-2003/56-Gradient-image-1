@@ -158,8 +158,14 @@ class Trainer:
         self.cfg, self.model, self.items, self.raw_conds, self.out_dir, self.budget = cfg, model, items, raw_conds, out_dir, budget
         self.twin = twin   # EvaluatorTwin or None: evaluator-exact scoring for the confirm stage
         self.device = model.load_device
-        self.train_items = [i for i in items if not i["holdout"]]
+        # --oracle-train-all (dev only): train on EVERY image including the holdout, so the holdout score
+        # becomes the ceiling any data/prior lever could reach on these images (generalisation gap = this
+        # minus the clean run). Never on the validator.
+        oracle = bool(getattr(cfg, "oracle_train_all", False))
+        self.train_items = list(items) if oracle else [i for i in items if not i["holdout"]]
         self.holdout_items = [i for i in items if i["holdout"]]
+        if oracle:
+            log(f"ORACLE: training on all {len(self.train_items)} images including the {len(self.holdout_items)} holdout images")
         if not self.train_items or not self.holdout_items:
             raise ValueError("need at least one training and one holdout image")
         self.rng = random.Random(cfg.seed)
