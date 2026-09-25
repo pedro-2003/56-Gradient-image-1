@@ -496,7 +496,13 @@ class Trainer:
                 log(f"m{member} polish plateau at step {step} (best {mb.tag}@{mb.step}); {budget.remaining():.0f}s left for confirms")
                 break
             if plateau and want_phase2:
-                need_next = max(1, mb.step) * budget.est_step() + 3 * budget.est_eval() + budget.est_eval(cfg.confirm_noises) * cfg.confirm_top
+                if getattr(cfg, "replan", False):
+                    # v6.3: with --replan the rest of the budget goes to blind members, so the exit is gated on
+                    # ONE blind member (s* scaled to all images) plus the replan's own reserve, not on a phase-2 member
+                    steps_all = math.ceil(max(1, mb.step) * len(self.items) / max(1, len(self.train_items)))
+                    need_next = steps_all * budget.est_step() + budget.est_eval(cfg.confirm_noises) + 2 * budget.est_eval() + 60
+                else:
+                    need_next = max(1, mb.step) * budget.est_step() + 3 * budget.est_eval() + budget.est_eval(cfg.confirm_noises) * cfg.confirm_top
                 if budget.fits(need_next):
                     plateau_exit = True
                     log(f"m{member} plateau at step {step} (best {mb.tag}@{mb.step}); handing {budget.remaining():.0f}s to the next member")
