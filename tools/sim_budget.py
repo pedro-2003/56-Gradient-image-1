@@ -224,7 +224,8 @@ class Sim:
                 plateau_window=pol.get("plateau_window", 3), screen_ema_only=pol.get("screen_ema_only", False),
                 empty_prompt_frac=0.5, select_metric="mean", eval_every=pol.get("eval_every", 0), holdout_names="",
                 replan=pol.get("replan", False), replan_max_members=3, init_lora="", flip=False,
-                adaptive_cadence=pol.get("adaptive_cadence", False), oracle_train_all=False, twin=self.p["twin"])
+                adaptive_cadence=pol.get("adaptive_cadence", False), oracle_train_all=False, twin=self.p["twin"],
+                screen_passes=pol.get("screen_passes", ""), screen_max_share=pol.get("screen_max_share", 0.3), seed2=pol.get("seed2", False))
             deadline = self.clock.t + self.hours * 3600.0
             self.t_start = self.clock.t
             budget = budget_mod.Budget(deadline)
@@ -248,7 +249,7 @@ class Sim:
             "family": self.family, "hours": self.hours, "n_train": self.n_train, "policy": self.policy.get("name", "?"),
             "pick": f"{fin.get('picked')}@{fin.get('step')} m{fin.get('member')}", "true_r_pick": round(r_pick, 3), "true_min": round(rmin, 3),
             "regret": round(r_pick - rmin, 3), "members": [(m["member"], m["best_step"], m["plateau_exit"]) for m in s.get("members", [])],
-            "replan": s.get("replan"), "screens": sum(1 for e in self.events if e[1] == "screen"), "confirms": sum(1 for e in self.events if e[1] == "confirm"),
+            "replan": s.get("replan"), "seed2": s.get("seed2"), "screens": sum(1 for e in self.events if e[1] == "screen"), "confirms": sum(1 for e in self.events if e[1] == "confirm"),
             "m0_exit_min": next((round(e[0], 1) for e in self.events if e[1] == "screen" and e[2] == 1), None),
             "end_min": round(end_min, 1), "slack_min": round(self.hours * 60 - end_min, 1), "steps": s["steps"],
         }
@@ -257,10 +258,13 @@ class Sim:
         return (self.clock.t - self.t_start) / 60.0
 
 
+SCHED = "0.5,1,1.5,2,2.5,3,3.5,4,5,6,8,10,12,16"
 POLICIES = {
     "v6.3":            {"name": "v6.3"},
     "v6.3+replan":     {"name": "v6.3+replan", "replan": True},
     "v6.3+adaptive":   {"name": "v6.3+adaptive", "adaptive_cadence": True},
+    "v7-passes":       {"name": "v7-passes", "screen_passes": SCHED},
+    "v7-passes+seed2": {"name": "v7-passes+seed2", "screen_passes": SCHED, "seed2": True},
 }
 
 REGIMES = [   # (family, hours, n_train, n_holdout, label)
@@ -294,6 +298,9 @@ def main():
             r = Sim(fam, h, ntr, nho, pol).run()
             rp = r["replan"] or {}
             rps = ("replan " + (rp.get("skipped") or f"k={rp.get('members')} ship={rp.get('ship')}")) if pol.get("replan") else ""
+            if pol.get("seed2"):
+                s2 = r.get("seed2") or {}
+                rps = "seed2 " + (s2.get("skipped") or ("ran" if s2 else "no exit"))
             print(f"{label:6} {fam:10} {h:>4} {ntr:>3} {pname:14} {r['pick'][:24]:24} {r['true_r_pick']:>7} {r['true_min']:>7} {r['regret']:>6} "
                   f"{r['screens']:>3} {r['confirms']:>3} {str(r['m0_exit_min']):>5} {r['end_min']:>5} {r['slack_min']:>5}  {r['members']} {rps}")
 

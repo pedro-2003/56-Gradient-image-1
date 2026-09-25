@@ -142,7 +142,7 @@ def main():
         lr=3e-3, lr_final_frac=0.1, warmup_steps=5, weight_decay=0.0, grad_clip=1.0, lora_plus_ratio=1.0, ema=0.99,
         eval_share=0.25, confirm_top=3, confirm_noises=4, phase2=True, max_members=a.max_members,
         polish=a.polish, polish_lr_frac=0.3, band_power=0.0, plateau_window=a.plateau_window, screen_ema_only=a.screen_ema_only,
-        empty_prompt_frac=0.5, select_metric="mean", eval_every=0, holdout_names="", replan=a.replan, replan_max_members=3, init_lora=a.init_lora, flip=False, adaptive_cadence=a.adaptive_cadence, oracle_train_all=False)
+        empty_prompt_frac=0.5, select_metric="mean", eval_every=0, holdout_names="", replan=a.replan, replan_max_members=3, init_lora=a.init_lora, flip=False, adaptive_cadence=a.adaptive_cadence, oracle_train_all=False, screen_passes="", screen_max_share=0.3, seed2=False)
     budget = Budget(time.time() + a.seconds, kill_margin_s=0.0, publish_reserve_s=2.0)
     os.makedirs(a.out, exist_ok=True)
     os.environ["GOD_TRAIN_LOGS"] = "1"

@@ -321,6 +321,26 @@ class Trainer:
                     pass
         return verify_loadable(self.model, dev_state, scale)
 
+    def _pass_steps(self):
+        reps = self._band_repeats() if hasattr(self, "_band_repeats") else None
+        per_img = sum(reps) if reps else C.EVAL_STRATA
+        return max(1, len(self.train_items) * per_img)
+
+    def _next_screen_step(self, last_eval):
+        """--screen-passes: the next scheduled step after `last_eval` (Law 1: the optimum is a number of
+        passes). Spacing never drops below what --screen-max-share allows; past the list, the last spacing."""
+        sched = [float(x) for x in str(getattr(self.cfg, "screen_passes", "") or "").split(",") if x.strip()]
+        ps = self._pass_steps()
+        share = float(getattr(self.cfg, "screen_max_share", 0.30))
+        point_cost = self.budget.est_eval() * self._screens_per_point()
+        min_gap = max(20, int(math.ceil(point_cost * (1 - share) / (share * max(1e-3, self.budget.est_step())))))
+        pts = [int(round(p * ps)) for p in sched]
+        for s in pts:
+            if s >= last_eval + min_gap:
+                return s
+        gap = (pts[-1] - pts[-2]) if len(pts) >= 2 else ps
+        return last_eval + max(min_gap, gap)
+
     def _eval_every(self, member=None):
         """Steps between eval points so that screening takes ~cfg.eval_share of wall-clock. With
         --adaptive-cadence the interval widens while the curve is still descending (x1.5, x2, x2.5,
@@ -403,6 +423,10 @@ class Trainer:
             # remaining budget can plausibly carry a fresh member to a comparable optimum
             if getattr(cfg, "replan", False):
                 break                                   # the replan spends the rest on blind members
+            if getattr(cfg, "seed2", False):
+                if plateau_exit:
+                    self._seed2(guider, extra, m_best)
+                break
             if not plateau_exit or member + 1 >= cfg.max_members:
                 break
             member += 1
@@ -477,12 +501,18 @@ class Trainer:
         horizon_end = time.time() + max(60.0, budget.remaining() - budget.est_eval(cfg.confirm_noises) * cfg.confirm_top)
         step, last_eval, cases, raw_hist = 0, 0, [], []
         m_best = None            # this member's own best (v6.1 M3), separate from the global self.best
+        next_screen = None       # --screen-passes schedule (v7)
         bad = 0                  # consecutive non-finite steps (v6.1 M4)
         plateau_exit = False
         peak, warm_base, polishing, tag_prefix, pol_points = cfg.lr, 0, False, "", 0
         while True:
             now = time.time()
-            due = (step - last_eval) >= self._eval_every(member)
+            if getattr(cfg, "screen_passes", ""):
+                if next_screen is None:
+                    next_screen = self._next_screen_step(last_eval)
+                due = step >= next_screen
+            else:
+                due = (step - last_eval) >= self._eval_every(member)
             need = budget.est_step() + (budget.est_eval() * (self._screens_per_point() + 0.2) + 5 if due else 0)
             if now + need > horizon_end or not budget.fits(need):
                 break
@@ -495,18 +525,29 @@ class Trainer:
             win = getattr(cfg, "plateau_window", 3)
             if 0 <= self.selector.best_point_index(member) <= 1:
                 win = min(win, 2)
-            plateau = (want_phase2 or want_polish or polishing) and self.selector.plateaued(window=win, member=member)
+            want_seed2 = getattr(cfg, "seed2", False) and member == 0
+            plateau = (want_phase2 or want_polish or polishing or want_seed2) and self.selector.plateaued(window=win, member=member)
             mb = m_best or self.best
             if polishing and pol_points >= 3 and plateau:
                 # the anneal has converged too: hand the rest to the confirm stage
                 log(f"m{member} polish plateau at step {step} (best {mb.tag}@{mb.step}); {budget.remaining():.0f}s left for confirms")
                 break
-            if plateau and want_phase2:
+            if plateau and member == 0 and getattr(cfg, "seed2", False) and mb.step > 0 and mb.member == 0:
+                # v7: exit only if a clean second seed of s* steps, its screen, the soup screen and one soup
+                # confirm fit; otherwise keep training member 0 (never leave dead time)
+                need_s2 = mb.step * budget.est_step() + 2 * budget.est_eval() + budget.est_eval(cfg.confirm_noises) * (1.5 if self.twin else 1.0) + 60
+                if budget.fits(need_s2) and self._well_formed(mb):
+                    plateau_exit = True
+                    log(f"m0 plateau at step {step} (best {mb.tag}@{mb.step}); seed2 for {mb.step} steps fits ({need_s2:.0f}s of {budget.remaining():.0f}s)")
+                    break
+            if plateau and want_phase2 and not getattr(cfg, "seed2", False):
                 if getattr(cfg, "replan", False):
                     # v6.3: with --replan the rest of the budget goes to blind members, so the exit is gated on
                     # ONE blind member (s* scaled to all images) plus the replan's own reserve, not on a phase-2 member
                     steps_all = math.ceil(max(1, mb.step) * len(self.items) / max(1, len(self.train_items)))
                     need_next = steps_all * budget.est_step() + budget.est_eval(cfg.confirm_noises) + 2 * budget.est_eval() + 60
+                    if not self._well_formed(mb):
+                        need_next = float("inf")       # v7: the replan would skip -> never exit into dead time
                 else:
                     need_next = max(1, mb.step) * budget.est_step() + 3 * budget.est_eval() + budget.est_eval(cfg.confirm_noises) * cfg.confirm_top
                 if budget.fits(need_next):
@@ -593,6 +634,7 @@ class Trainer:
                 log(f"m{member} step {step} loss {loss.item():.4f} band {band} lr {lr:.2e} step {budget.est_step():.2f}s left {horizon_end - time.time():.0f}s {self._mem()}")
             if due:
                 last_eval = step
+                next_screen = None
                 m_best = self._screen_candidates(guider, extra, member, step, ema, raw_hist, m_best, tag_prefix=tag_prefix)
                 if polishing:
                     pol_points += 1
@@ -639,6 +681,29 @@ class Trainer:
             self.summary["band_repeats"] = reps
             log(f"band repeats (power {power}): {reps}")
         return reps
+
+    def _seed2(self, guider, extra, m0):
+        """v7: a clean second seed for exactly s* steps on the training images (annealed to s*), then the
+        soup of it and member 0's best. Both are screened on the untouched holdout and join the selector;
+        the confirm stage and the 1-SE rule decide what ships."""
+        cfg, budget = self.cfg, self.budget
+        self.lora.reinit(cfg.seed + 1000 * 1)
+        st = self._train_fixed(guider, extra, 1, m0.step, items=self.train_items)
+        if st is None or not budget.fits(2 * budget.est_eval() + 30):
+            self.summary["seed2"] = {"skipped": "did not finish", "steps": m0.step}
+            return
+        c1 = Candidate("seed2", m0.step, st, self.lora.scale, member=1)
+        self._screen(guider, extra, c1)
+        self.selector.add(c1)
+        soup = Candidate("soup2", m0.step, soup_state([m0.state, st]), self.lora.scale, member=-1)
+        self._screen(guider, extra, soup)
+        self.selector.add(soup)
+        for c in (c1, soup):
+            if c.score < self.best.score:
+                self.best = c
+                self.save({n: (u.to(self.device), d.to(self.device)) for n, (u, d) in c.state.items()}, c.scale, c.score, f"{c.tag}@{c.step}")
+        self.summary["seed2"] = {"s_star": m0.step, "seed2": c1.score, "soup": soup.score, "m0": m0.screen.score if m0.screen else None}
+        log(f"seed2: member-0 best {m0.screen.score if m0.screen else float('nan'):.6f}, seed2 {c1.score:.6f}, soup {soup.score:.6f}")
 
     def _well_formed(self, m0):
         """Member 0's curve supports a blind replan: a confirmed-interior optimum (a later screened

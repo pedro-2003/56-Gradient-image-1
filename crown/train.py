@@ -75,6 +75,9 @@ def parse(argv=None):
                    help="after member 0's best step s* is known, train further members on ALL images for s* steps "
                         "(annealed, blind) with the time left and ship the soup when member 0's curve is well-formed")
     p.add_argument("--replan-max-members", type=int, default=3, help="at most this many blind members")
+    p.add_argument("--screen-passes", default="", help="screen schedule in passes over the (image, band) cases, e.g. 0.5,1,1.5,2")
+    p.add_argument("--screen-max-share", type=float, default=0.30, help="cap on the wall-clock share of screens under --screen-passes")
+    p.add_argument("--seed2", action="store_true", help="after the plateau: a clean second seed for s* steps + soup (v7)")
     p.add_argument("--oracle-train-all", action="store_true", help="DEV ONLY: train on the holdout images too (ceiling measurement)")
     p.add_argument("--adaptive-cadence", action="store_true",
                    help="space screens out while the holdout curve is still descending (late-optimum families)")
