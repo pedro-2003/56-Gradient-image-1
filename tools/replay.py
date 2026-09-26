@@ -144,10 +144,22 @@ def cmd_identify(a):
     best, second = joint[0], joint[1] if len(joint) > 1 else (float("inf"), ())
     ident = {"hidden": [names[i] for i in best[1]], "worst_rel_residual": best[0], "runner_up_rel_residual": second[0],
              "margin": (second[0] / best[0]) if best[0] > 0 else float("inf"), "entrants_used": list(per)}
-    ident["identified"] = best[0] < a.tol and ident["margin"] > 10
+    # Measured replica precision vs the validator is ~1e-4 relative (9159e3dc, 87f69ea0), so an exact match
+    # cannot be demanded. Identified = the most precise entrant's own best subset is (a) within --tol,
+    # (b) at least --margin times better than its runner-up, and (c) the joint best over all entrants.
+    per_ent = {}
+    for hk, (t, L) in per.items():
+        ranked = sorted((abs(sum(L[i] for i in idx) / h - t) / t, idx) for idx in itertools.combinations(range(len(names)), h))
+        per_ent[hk] = {"best": [names[i] for i in ranked[0][1]], "rel": ranked[0][0],
+                       "margin": ranked[1][0] / ranked[0][0] if len(ranked) > 1 and ranked[0][0] > 0 else float("inf")}
+    anchor = min(per_ent.values(), key=lambda v: v["rel"])
+    ident["per_entrant"] = per_ent
+    ident["identified"] = anchor["rel"] < a.tol and anchor["margin"] > a.margin and anchor["best"] == ident["hidden"]
     json.dump(ident, open(os.path.join(a.task_dir, "hidden.json"), "w"), indent=1)
-    print(f"IDENTIFY {meta['task'][:8]}: hidden {ident['hidden']} worst rel residual {best[0]:.2e}, runner-up {second[0]:.2e} "
-          f"(margin x{ident['margin']:.0f}) -> {'IDENTIFIED' if ident['identified'] else 'AMBIGUOUS'}")
+    print(f"IDENTIFY {meta['task'][:8]}: hidden {ident['hidden']} joint worst rel residual {best[0]:.2e} (runner-up x{ident['margin']:.0f}); "
+          f"anchor entrant rel {anchor['rel']:.2e} margin x{anchor['margin']:.0f} -> {'IDENTIFIED' if ident['identified'] else 'AMBIGUOUS'}")
+    for hk, v in per_ent.items():
+        print(f"   {hk}: own best {v['best']} rel {v['rel']:.2e} (runner-up x{v['margin']:.0f})")
 
 
 # ------------------------------------------------------------------------------------------ build
@@ -208,7 +220,8 @@ def main():
     i.add_argument("--base", required=True)
     i.add_argument("--repo-dir", default=None)
     i.add_argument("--max-entrants", type=int, default=2)
-    i.add_argument("--tol", type=float, default=1e-5, help="max relative residual accepted as an exact match")
+    i.add_argument("--tol", type=float, default=3e-4, help="max relative residual of the anchoring entrant (replica precision ~1e-4)")
+    i.add_argument("--margin", type=float, default=20.0, help="the anchoring entrant's runner-up must be this many times worse")
     b = sub.add_parser("build")
     b.add_argument("--task-dir", required=True)
     b.add_argument("--cache", required=True)
