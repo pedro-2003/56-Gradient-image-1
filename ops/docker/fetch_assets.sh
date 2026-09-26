@@ -17,7 +17,10 @@ fetch() {  # name url
   local name=$1 url=$2 left
   left=$(( BUDGET - ($(date +%s) - start) ))
   if [ "$left" -le 30 ]; then echo "asset budget exhausted; skipping $name"; return 0; fi
-  if timeout "$left" curl -fL --retry 3 --retry-delay 2 -o "$DEST/$name.part" "$url"; then
+  # -sS: no progress meter. The meter is '\r'-separated with no '\n' for minutes, and the validator's build-log
+  # reader (G.O.D core/logging.py stream_image_build_logs) buffers the stream until '\n' and rescans that
+  # buffer on every chunk; a 2026-09-24 cold build on the VPS wrote 4.6 GB of meter output. Errors still print.
+  if timeout "$left" curl -fsSL --retry 3 --retry-delay 2 -o "$DEST/$name.part" "$url"; then
     mv -f "$DEST/$name.part" "$DEST/$name"
     echo "fetched $name ($(du -h "$DEST/$name" | cut -f1)) at t=$(( $(date +%s) - start ))s"
   else

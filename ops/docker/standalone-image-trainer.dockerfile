@@ -8,7 +8,7 @@ FROM python:3.11-slim
 # no build args) under a 30-minute cap for every task. On docker 29's containerd image store every step
 # after a large layer pays a fixed commit cost (measured 2026-09-26 on the build VPS: ~35 s per step,
 # even for ARG/COPY, once the torch layer exists), so every cheap step (ARG, ENV, WORKDIR, ENTRYPOINT,
-# COPY) comes BEFORE the large layers, the import check shares the requirements RUN, and the 19 GB asset
+# COPY) comes BEFORE the large layers, the import check shares the requirements RUN, and the ~10 GB asset
 # pull is the last step. The image content is unchanged.
 ARG COMFYUI_COMMIT=694815f498295080a0e15a1502edc9dba841b110
 ARG FLUX_TE_REV=6af2a98e3f615bdfa612fbd85da93d1ed5f69ef5
