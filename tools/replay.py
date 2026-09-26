@@ -12,17 +12,25 @@ images ranks directly among the public test_losses of every entrant.
     python tools/replay.py identify --task-dir /workspace/replay/<task8> --family F --base B [--repo-dir R] [--max-entrants 2]
     python tools/replay.py build    --task-dir /workspace/replay/<task8> --cache /workspace/cache
     python tools/replay.py rank     --task-dir /workspace/replay/<task8> --pair-json /root/pair/<tag>/pair.json --name <tag>
+    python tools/replay.py rehearse --dataset-dir <images> --name r1flux_x --family flux --base-repo rayonlabs/FLUX.1-dev                                     --hours 0.75 --n 30 --seed 20260926 --out /workspace/replay
+
+`rehearse` builds a replay-shaped task (no entrants) from any image set, for regimes no public task covers
+(flux at the round-1 size): a seeded subset of --n images and the validator's hidden count drawn by the
+same seeded rng; build / score / rank then run unchanged (rank reports ours against the base).
 
 Runs on the GPU box (downloads go box <- HF directly; nothing passes through the PC).
 """
 import argparse
+import hashlib
 import itertools
 import json
 import math
 import os
+import random
 import shutil
 import sys
 import urllib.request
+import uuid
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -194,9 +202,38 @@ def cmd_build(a):
 
 
 # ------------------------------------------------------------------------------------------- rank
+def cmd_rehearse(a):
+    names = image_names(a.dataset_dir)
+    rng = random.Random(a.seed)
+    pick = sorted(rng.sample(names, a.n)) if a.n < len(names) else names
+    h = hidden_count(len(pick))
+    hidden = sorted(rng.sample(pick, h))
+    out = os.path.join(a.out, a.name)
+    sub = os.path.join(out, "images")
+    shutil.rmtree(sub, ignore_errors=True)
+    os.makedirs(sub)
+    for n in pick:
+        stem = os.path.splitext(n)[0]
+        for f in [n] + ([stem + ".txt"] if os.path.exists(os.path.join(a.dataset_dir, stem + ".txt")) else []):
+            shutil.copy2(os.path.join(a.dataset_dir, f), os.path.join(sub, f))
+    task = str(uuid.UUID(hashlib.sha256(f"rehearse:{a.name}".encode()).hexdigest()[:32]))
+    meta = {"tournament": "rehearsal", "task": task, "family": a.family, "base_repo": a.base_repo, "hours": a.hours,
+            "dataset_dir": os.path.abspath(sub), "n_images": len(pick), "n_hidden": h, "entrants": [],
+            "source": os.path.abspath(a.dataset_dir), "seed": a.seed}
+    json.dump(meta, open(os.path.join(out, "replay.json"), "w"), indent=1)
+    json.dump({"hidden": hidden, "identified": True, "rehearsal": True}, open(os.path.join(out, "hidden.json"), "w"), indent=1)
+    print(f"REHEARSE {a.name}: {len(pick)} of {len(names)} images from {a.dataset_dir}; hidden {hidden}; given {len(pick) - h}; task {task}")
+
+
 def cmd_rank(a):
     meta = json.load(open(os.path.join(a.task_dir, "replay.json")))
-    ours = json.load(open(a.pair_json))[a.name]["score"]
+    pair = json.load(open(a.pair_json))
+    ours = pair[a.name]["score"]
+    if not meta["entrants"]:
+        base = (pair.get("base") or {}).get("score")
+        rel = f", {(ours / base - 1) * 100:+.3f}% vs base {base:.6f}" if base else ""
+        print(f"RANK {meta['task'][:8]} {meta['family']}: ours {ours:.6f}{rel} (rehearsal: no entrants)")
+        return
     board = sorted((e["test_loss"], e["hotkey"][:8]) for e in meta["entrants"] if e.get("test_loss") is not None)
     failed = [e["hotkey"][:8] for e in meta["entrants"] if e.get("test_loss") is None]
     rank = 1 + sum(1 for t, _ in board if t < ours)
@@ -230,8 +267,17 @@ def main():
     r.add_argument("--task-dir", required=True)
     r.add_argument("--pair-json", required=True)
     r.add_argument("--name", required=True)
+    h = sub.add_parser("rehearse")
+    h.add_argument("--dataset-dir", required=True)
+    h.add_argument("--name", required=True)
+    h.add_argument("--family", required=True)
+    h.add_argument("--base-repo", required=True)
+    h.add_argument("--hours", type=float, required=True)
+    h.add_argument("--n", type=int, required=True)
+    h.add_argument("--seed", type=int, required=True)
+    h.add_argument("--out", required=True)
     a = p.parse_args()
-    {"fetch": cmd_fetch, "identify": cmd_identify, "build": cmd_build, "rank": cmd_rank}[a.cmd](a)
+    {"fetch": cmd_fetch, "identify": cmd_identify, "build": cmd_build, "rank": cmd_rank, "rehearse": cmd_rehearse}[a.cmd](a)
 
 
 if __name__ == "__main__":
