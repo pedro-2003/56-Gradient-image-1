@@ -40,6 +40,9 @@ def parse(argv=None):
     p.add_argument("--ckpt", dest="ckpt", action="store_true", default=True)
     p.add_argument("--no-ckpt", dest="ckpt", action="store_false")
     p.add_argument("--ckpt-stride", type=int, default=1)
+    p.add_argument("--fast-lora", action="store_true",
+                   help="train through the merged-forward / rank-r-gradient Function (crown.lora._MergedLoraLinear): "
+                        "same forward values, no full weight-gradient GEMM, no merged weights kept for backward")
     p.add_argument("--text-enc-dtype", default=None, choices=[None, "fp16", "bf16", "fp32"])
     # holdout / selection / phase 2
     p.add_argument("--holdout-frac", type=float, default=0.10)

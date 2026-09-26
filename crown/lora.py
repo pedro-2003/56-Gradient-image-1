@@ -43,6 +43,63 @@ class LoraWrapper:
         return self
 
 
+class _MergedLoraLinear(torch.autograd.Function):
+    """Training forward/backward of one LoRA-targeted Comfy Linear under --fast-lora.
+
+    Forward: exactly the weight-wrapper path, y = F.linear(x, W', b) with W' produced by Comfy's
+    cast_bias_weight and this module's LoraWrapper (the evaluator's merge numerics), so the values are
+    bitwise those of the default path. Backward: dL/dx = dy W' with W' merged again (it is never kept
+    alive between forward and backward), and the LoRA gradients through the rank-r activation path,
+        dL/dup = scale * dy^T (x down^T),        dL/ddown = scale * (dy up)^T x,
+    which is the straight-through gradient of the merge (dL/dW' = dy^T x, contracted with down and up by
+    associativity) without ever forming the out x in weight gradient. Per Linear this costs one forward
+    and one input-gradient GEMM plus rank-r products, where the default path also runs the full
+    weight-gradient GEMM; it keeps only the input activation, so a whole model's activations can fit
+    without gradient checkpointing."""
+
+    @staticmethod
+    def forward(ctx, x, up, down, module, scale):
+        import comfy.ops as ops
+
+        weight, bias, stream = ops.cast_bias_weight(module, x, offloadable=True)
+        y = torch.nn.functional.linear(x, weight, bias)
+        ops.uncast_bias_weight(module, weight, bias, stream)
+        ctx.module, ctx.scale = module, scale
+        ctx.save_for_backward(x, up, down)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        import comfy.ops as ops
+
+        x, up, down = ctx.saved_tensors
+        dx = d_up = d_down = None
+        if ctx.needs_input_grad[0]:
+            weight, bias, stream = ops.cast_bias_weight(ctx.module, x, offloadable=True)
+            dx = torch.matmul(dy, weight.to(dy.dtype))
+            ops.uncast_bias_weight(ctx.module, weight, bias, stream)
+        if ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
+            x2 = x.reshape(-1, x.shape[-1]).float()
+            dy2 = dy.reshape(-1, dy.shape[-1]).float()
+            if ctx.needs_input_grad[1]:
+                d_up = (dy2.t() @ (x2 @ down.float().t())).mul_(ctx.scale).to(up.dtype)
+            if ctx.needs_input_grad[2]:
+                d_down = ((dy2 @ up.float()).t() @ x2).mul_(ctx.scale).to(down.dtype)
+        return dx, d_up, d_down, None, None
+
+
+def _fast_forward(module, orig):
+    """Replacement for one module's forward_comfy_cast_weights: the merged-forward / rank-r-gradient
+    Function while the LoRA trains, the untouched Comfy path otherwise (scoring, frozen LoRA)."""
+    def forward_comfy_cast_weights(input, *args, **kwargs):
+        w = module._crown_wrapper
+        if (args or kwargs or not torch.is_grad_enabled() or not w.enabled or w.up is None
+                or not (w.up.requires_grad or w.down.requires_grad)):
+            return orig(input, *args, **kwargs)
+        return _MergedLoraLinear.apply(input, w.up, w.down, module, w.scale)
+    return forward_comfy_cast_weights
+
+
 def select_targets(diffusion_model, include=None, exclude=None):
     inc = re.compile(include) if include else None
     exc = re.compile(exclude) if exclude else None
@@ -67,6 +124,7 @@ class Lora:
         self.scale = self.alpha / rank
         self.shapes = [(name, tuple(m.weight.shape)) for name, m in targets]
         self.names = [n for n, _ in self.shapes]
+        self.modules = {name: m for name, m in targets}
         self.wrappers = {n: LoraWrapper(self.scale) for n in self.names}
         self.reinit(seed)
 
@@ -85,6 +143,23 @@ class Lora:
     def attach(self, patcher):
         for name, w in self.wrappers.items():
             patcher.add_weight_wrapper(f"diffusion_model.{name}.weight", w)
+
+    def enable_fast_path(self):
+        """--fast-lora: route every targeted Linear whose op class uses Comfy's standard cast-then-linear
+        forward through _MergedLoraLinear; any other op class keeps the weight-wrapper path (fail closed).
+        Returns the number of routed modules."""
+        import comfy.ops as ops
+
+        std = {ops.disable_weight_init.Linear.forward_comfy_cast_weights, ops.fp8_ops.Linear.forward_comfy_cast_weights}
+        n = 0
+        for name, m in self.modules.items():
+            if getattr(type(m), "forward_comfy_cast_weights", None) not in std or getattr(m, "_crown_fast", False):
+                continue
+            m._crown_wrapper = self.wrappers[name]
+            m.forward_comfy_cast_weights = _fast_forward(m, m.forward_comfy_cast_weights)
+            m._crown_fast = True
+            n += 1
+        return n
 
     # --- candidate states ---------------------------------------------------------
     def state(self):

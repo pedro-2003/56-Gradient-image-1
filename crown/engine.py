@@ -171,6 +171,10 @@ class Trainer:
             raise ValueError("LoRA include/exclude selected no Linear layers")
         self.lora = Lora(targets, cfg.rank, cfg.alpha, self.device, cfg.seed)
         self.lora.attach(model)
+        if getattr(cfg, "fast_lora", False):
+            n = self.lora.enable_fast_path()
+            self.summary["fast_lora"] = {"routed": n, "targets": len(targets)}
+            log(f"fast LoRA path on {n}/{len(targets)} Linears")
         self._ckpt_on = bool(cfg.ckpt)
         if cfg.ckpt:
             log("gradient checkpointing on", enable_checkpointing(model.model.diffusion_model, stride=cfg.ckpt_stride), "blocks")
