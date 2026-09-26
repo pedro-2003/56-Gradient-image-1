@@ -69,6 +69,16 @@ def run(a, entries):
             return lora_names[repo], {"repo": repo, "revision": "local", "filename": lora_names[repo]}
         return artifacts.materialize_model(api, repo, filename, directory)
 
+    if a.eval_gpu == "a100":
+        # the validator scores on A100s: its stochastic-rounding noise and its fp8 path, not this GPU's
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        sys.path.insert(0, str(root))            # the evaluator inserts the same root before importing comfy
+        from crown import contract as C
+        from crown.philox import install_evaluator_gpu
+
+        g = C.EVAL_GPU
+        print(install_evaluator_gpu(g["sm_count"], g["threads_per_sm"], g["fp8_compute"]), flush=True)
+
     recorded, names = [], []
     parent = diffusion.FlowPredictionSampler
 
@@ -166,6 +176,8 @@ def main():
     p.add_argument("--noises", type=int, default=16)
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--repo-dir", default=None)
+    p.add_argument("--eval-gpu", choices=["a100", "local"], default="a100",
+                   help="a100: reproduce the validator's evaluator GPU (crown.contract.EVAL_GPU); local: this GPU's own numerics")
     p.add_argument("--with-base", action="store_true", help="also score a zeroed copy of the first LoRA (= the base model)")
     p.add_argument("--ref", default=None, help="reference for the paired band deltas (default: base if scored, else the first LoRA)")
     p.add_argument("loras", nargs="+", help="name=path")

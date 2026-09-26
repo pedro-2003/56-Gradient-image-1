@@ -47,6 +47,12 @@ EVAL_TEXT_WEIGHT = 0.5                           # DIFFUSION_TEXT_GUIDED_EVAL_WE
 EVAL_BATCH = 2                                   # IMAGE_EVAL_BATCH_SIZE default
 EVAL_CFG = 1.0
 EVAL_SAMPLER_SEED = 42
+# The evaluator's GPU (G.O.D validator/evaluation: run_evaluation_basilica_image -> gpu_models = BASILICA_GPU_MODELS
+# = ["A100"], 80 GB; the runpod backend asks for "A100" too). Training runs on an H100 (gpu_requirements.py:
+# IMAGETASK -> H100_1X). Both facts change numbers the evaluator computes: torch.randint's kernel geometry (the
+# stochastic-rounding noise of every patched fp8 weight) and supports_fp8_compute (sm80: comfy_quant layers are
+# emulated - dequantised weights, bf16 activations). crown.philox.install_evaluator_gpu reproduces both.
+EVAL_GPU = {"name": "A100", "sm_count": 108, "threads_per_sm": 2048, "fp8_compute": False}
 
 # --- dataset (validator/tasks/datasets/preparation.py, core/constants/datasets.py)
 TEST_SPLIT_FRACTION = 0.10                       # ceil(N * 0.10) held out, disjoint, unseeded shuffle
