@@ -141,6 +141,21 @@ class EvaluatorTwin:
         mm.unload_all_models()
         torch.cuda.empty_cache()
 
+    def patched_weights(self, state, scale, keys):
+        """The weights the evaluator's ModelPatcher produces for `keys` under this LoRA state
+        (patch_weight_to_device with return_weight: the merge and, for fp8, the stochastic re-rounding),
+        upcast to bf16 on the CPU. Empty dict if the state would not load."""
+        try:
+            self._load()
+            patched, missing = apply_lora_like_evaluator(self.base, state, scale)
+            if missing:
+                return {}
+            return {k: patched.patch_weight_to_device(k, device_to=self.device, return_weight=True).to(torch.bfloat16).cpu()
+                    for k in keys}
+        finally:
+            del state
+            self.release()
+
     def score(self, state, scale, noises=1):
         """ScoreReport for `state` computed the evaluator's way, or None (+reason) if it
         would not load. The base is loaded for the call and released afterwards; the

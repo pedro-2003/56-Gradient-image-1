@@ -29,6 +29,8 @@ class LoraWrapper:
         self.down = None
         self.scale = scale
         self.enabled = True
+        self.fp8_dtype = None    # --exact-merge: the evaluator re-rounds this plain-fp8 weight after the merge
+        self.seed = 0            # ... stochastically, seeded by comfy.utils.string_to_seed(<state-dict key>)
 
     def __call__(self, w):
         if not self.enabled or self.up is None:
@@ -36,11 +38,28 @@ class LoraWrapper:
         delta = (self.up.float() @ self.down.float()) * self.scale
         if w.dtype in (torch.bfloat16, torch.float16):
             # the evaluator merges in fp16 on sm80+ (lora_compute_dtype) and casts back (v6.1 F4)
-            return (w.to(torch.float16) + delta.reshape(w.shape).to(torch.float16)).to(w.dtype)
+            merged = w.to(torch.float16) + delta.reshape(w.shape).to(torch.float16)
+            if self.fp8_dtype is not None:
+                return _evaluator_fp8_round(merged, self.fp8_dtype, self.seed, w.dtype)
+            return merged.to(w.dtype)
         return (w.float() + delta.reshape(w.shape)).to(w.dtype)
 
     def to(self, device):
         return self
+
+
+def _evaluator_fp8_round(merged16, fp8_dtype, seed, out_dtype):
+    """The evaluator's last merge step for a plain-fp8 weight (ModelPatcher.patch_weight_to_device, no
+    set_weight on manual_cast/fp8_ops Linears): comfy.float.stochastic_rounding(merged fp16, fp8, seed =
+    string_to_seed(key)); Comfy's manual cast then upcasts it exactly for compute. The value returned is
+    exactly that rounded weight - what the evaluator will score - and the gradient passes straight through
+    the fp16 merge: q + (y - y.detach()) has value q (y - y is exactly zero) and derivative 1 in y."""
+    import comfy.float
+
+    y = merged16.to(out_dtype)
+    with torch.no_grad():
+        q = comfy.float.stochastic_rounding(merged16.detach(), fp8_dtype, seed=seed).to(out_dtype)
+    return q + (y - y.detach())
 
 
 class _MergedLoraLinear(torch.autograd.Function):
@@ -143,6 +162,25 @@ class Lora:
     def attach(self, patcher):
         for name, w in self.wrappers.items():
             patcher.add_weight_wrapper(f"diffusion_model.{name}.weight", w)
+
+    def enable_exact_merge(self):
+        """--exact-merge: every targeted Linear whose stored weight is plain fp8 (manual_cast / fp8_ops: no
+        set_weight, so the evaluator's ModelPatcher re-rounds the merged weight with
+        comfy.float.stochastic_rounding seeded by string_to_seed of its state-dict key) trains through that
+        exact rounding. Quantized-tensor layouts (layout_type, e.g. ideogram4's comfy_quant) re-quantise with
+        a recalculated scale instead and are left alone. Returns the number of modules switched."""
+        import comfy.utils
+
+        n = 0
+        for name, m in self.modules.items():
+            w = getattr(m, "weight", None)
+            if w is None or w.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2) or getattr(m, "layout_type", None) is not None:
+                continue
+            wr = self.wrappers[name]
+            wr.fp8_dtype = w.dtype
+            wr.seed = comfy.utils.string_to_seed(f"diffusion_model.{name}.weight")
+            n += 1
+        return n
 
     def enable_fast_path(self):
         """--fast-lora: route every targeted Linear whose op class uses Comfy's standard cast-then-linear

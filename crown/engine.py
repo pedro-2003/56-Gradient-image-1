@@ -171,6 +171,11 @@ class Trainer:
             raise ValueError("LoRA include/exclude selected no Linear layers")
         self.lora = Lora(targets, cfg.rank, cfg.alpha, self.device, cfg.seed)
         self.lora.attach(model)
+        self._parity_done = False
+        if getattr(cfg, "exact_merge", False):
+            n = self.lora.enable_exact_merge()
+            self.summary["exact_merge"] = {"modules": n, "targets": len(targets)}
+            log(f"exact fp8 merge on {n}/{len(targets)} Linears")
         if getattr(cfg, "fast_lora", False):
             n = self.lora.enable_fast_path()
             self.summary["fast_lora"] = {"routed": n, "targets": len(targets)}
@@ -264,12 +269,45 @@ class Trainer:
         finally:
             self._reload_training_model()
 
+    def _exact_merge_parity(self, cand):
+        """Runtime gate for --exact-merge: for three routed modules, the merged weight our wrapper feeds the
+        training forward must equal, element for element, the one the evaluator's own ModelPatcher builds
+        (the twin: merge + stochastic re-rounding seeded by the state-dict key). Logged and recorded."""
+        routed = [n for n in self.lora.names if self.lora.wrappers[n].fp8_dtype is not None]
+        names = [routed[i] for i in sorted({0, len(routed) // 2, len(routed) - 1})]
+        keys = {f"diffusion_model.{n}.weight": n for n in names}
+        dev_state = {n: (u.to(self.device), d.to(self.device)) for n, (u, d) in cand.state.items()}
+        try:
+            theirs = self.twin.patched_weights(dev_state, cand.scale, list(keys))
+        finally:
+            self._reload_training_model()
+        if not theirs:
+            log("exact-merge parity: the twin could not load this state; skipped")
+            return
+        self.lora.set_tensors(cand.state, cand.scale)
+        try:
+            with torch.no_grad():
+                ours = {k: self.lora.wrappers[n](self.lora.modules[n].weight.to(device=self.device, dtype=torch.bfloat16)).cpu()
+                        for k, n in keys.items()}
+        finally:
+            self.lora.restore()
+        res = {k: [int((ours[k] == theirs[k]).sum()), ours[k].numel()] for k in keys}
+        self.summary["exact_merge_parity"] = res
+        log("exact-merge parity vs the evaluator's patcher: " + ", ".join(f"{k.split('diffusion_model.')[-1]} {a}/{b}" for k, (a, b) in res.items()))
+
     def _confirm(self, guider, extra, cand: Candidate):
         """Confirm stage: the evaluator twin when we have one (exact numerics, real
         LoraLoader path), otherwise the hook path at more noise draws."""
         noises = self.cfg.confirm_noises
         if self.twin is None:
             return self._screen(guider, extra, cand, noises=noises)
+        if not self._parity_done and (self.summary.get("exact_merge") or {}).get("modules"):
+            self._parity_done = True
+            try:
+                self._exact_merge_parity(cand)
+            except Exception as e:  # noqa: BLE001 - an instrument, never a reason to fail the run
+                log(f"exact-merge parity check could not run: {type(e).__name__}: {e}")
+                self._reload_training_model()
         t0 = time.time()
         rep, missing = self._twin_score(cand.state, cand.scale, noises)
         dt = time.time() - t0

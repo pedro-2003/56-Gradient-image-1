@@ -40,6 +40,9 @@ def parse(argv=None):
     p.add_argument("--ckpt", dest="ckpt", action="store_true", default=True)
     p.add_argument("--no-ckpt", dest="ckpt", action="store_false")
     p.add_argument("--ckpt-stride", type=int, default=1)
+    p.add_argument("--exact-merge", action="store_true",
+                   help="plain-fp8 bases: train through the evaluator's post-merge stochastic fp8 rounding (seeded by the "
+                        "state-dict key), straight-through gradient; a no-op on bf16/fp16 bases")
     p.add_argument("--fast-lora", action="store_true",
                    help="train through the merged-forward / rank-r-gradient Function (crown.lora._MergedLoraLinear): "
                         "same forward values, no full weight-gradient GEMM, no merged weights kept for backward")
