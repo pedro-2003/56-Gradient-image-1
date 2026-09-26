@@ -40,20 +40,18 @@ RUN pip install --timeout 120 --retries 3 --no-cache-dir -r /opt/ComfyUI/require
     && python -c "import torch, diffusers, transformers; assert torch.__version__.startswith('2.9.1')" \
     && python -c "import comfy_kitchen"
 
-# INTEGRITY DECLARATION. Four public, unmodified files are baked because they are the
+# INTEGRITY DECLARATION. Five public, unmodified files are baked because they are the
 # *evaluator's own inputs* (validator/evaluation/image_flow_adapter.py FAMILIES) and the task
 # cache does not provide them in that form:
 #   - qwen_image_vae.safetensors, flux2-vae.safetensors: the VAEs the evaluator encodes with
 #     (the cache ships diffusers-layout VAEs, a different tensor than the one scored against);
+#   - ae.safetensors: the FLUX VAE the evaluator encodes with (rayonlabs/FLUX.1-dev);
 #   - clip_l.safetensors, t5xxl_fp16.safetensors: FLUX text encoders, which the validator's
-#     downloader does not stage at all (it fetches only tokenizer configs);
-#   - ideogram4_fp8_scaled.safetensors: the Ideogram-4 base the evaluator hard-codes
-#     (image_artifacts.prepare_base ignores the task model_id). The task cache ships a
-#     differently-quantised copy of the same weights; this file is used ONLY to score
-#     candidates the way the evaluator will, never as training data.
+#     downloader does not stage at all (it fetches only tokenizer configs).
+# The Ideogram-4 base the evaluator hard-codes is NOT baked: the evaluator twin rebuilds it from the
+# task cache's copy of the same weights (crown/twin.py) and uses it only to score candidates.
 # No dataset and no private artifact is bundled. Trained outputs derive solely from the
 # validator-provided base model and dataset.
-# Assets the trainer needs that the validator's /cache does not hold (VAEs, flux text encoders,
-# the evaluator's own ideogram4 base for the twin). The pulls run smallest-first under a hard time
-# budget and NEVER fail the build: a missing file degrades the trainer at run time instead.
+# The pulls run smallest-first under a hard time budget and NEVER fail the build: a missing file
+# degrades the trainer at run time instead.
 RUN ASSET_BUDGET_S=${ASSET_BUDGET_S} FLUX_TE_REV=${FLUX_TE_REV} bash /opt/crown/fetch_assets.sh

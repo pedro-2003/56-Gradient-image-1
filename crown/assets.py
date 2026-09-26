@@ -139,6 +139,13 @@ class Assets:
                 return None
         return getattr(self, "_ckpt_meta", None)
 
+    def ideogram4_raw_sd(self):
+        """The task cache's ideogram4 transformer exactly as stored (per-row scaled fp8 + weight_scale), for
+        rebuilding the evaluator's base in the twin (crown.twin.rebuild_ideogram4_evaluator_base)."""
+        tdir = os.path.join(self.model_dir, "transformer")
+        shards = _shards(tdir) if os.path.isdir(tdir) else _root_safetensors(self.model_dir)[:1]
+        return load_sharded(shards)
+
     def diffusion_sd(self):
         f = self.family
         if f == "ideogram4":
