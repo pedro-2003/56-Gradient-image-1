@@ -4,6 +4,8 @@
   timeout_kill      a trainer that hangs is killed before the deadline; the file it wrote stays published
   fallback_identity a trainer that produces nothing -> the identity-only fallback is invoked once
   nothing_exit1     nothing produced by either run -> exit 1
+  recipes_parse     every family's argv, exactly as run_trainer builds it, parses in crown/train.py and the
+                    recipe's switches land in the config (a typo in RECIPES would otherwise surface on the validator)
 
 The real trainer is replaced by a tiny fake script; cache/checkpoint roots are redirected to a temp dir.
 
@@ -128,8 +130,43 @@ def nothing_exit1():
     with_fake("nothing_even_identity", 0.5, body)
 
 
+def recipes_parse():
+    import types
+
+    from crown import train
+
+    class _Done:
+        def wait(self, timeout=None):
+            return 0
+
+    captured = []
+    orig_popen = it.subprocess.Popen
+    it.subprocess.Popen = lambda cmd, *a, **k: captured.append(cmd) or _Done()
+    extra = os.environ.pop("CROWN_EXTRA_ARGS", None)   # local experiments only: must not leak into this check
+    try:
+        for fam, recipe in it.RECIPES.items():
+            captured.clear()
+            it.run_trainer(types.SimpleNamespace(trigger_word=None), fam, "/m", "/d.zip", "/o", time.time() + 3600, [])
+            cfg = train.parse(captured[0][2:])
+            assert cfg.family == fam, f"{fam}: family {cfg.family}"
+            assert cfg.exact_merge == ("--exact-merge" in recipe), f"{fam}: exact_merge {cfg.exact_merge}"
+            assert cfg.fast_lora == ("--fast-lora" in recipe), f"{fam}: fast_lora {cfg.fast_lora}"
+            assert cfg.ckpt == ("--no-ckpt" not in recipe), f"{fam}: ckpt {cfg.ckpt}"
+            if "--screen-passes" in recipe:
+                want = recipe[recipe.index("--screen-passes") + 1]
+                assert cfg.screen_passes == want, f"{fam}: screen_passes {cfg.screen_passes!r}"
+                sched = [float(x) for x in want.split(",")]
+                assert sched == sorted(sched) and sched[0] > 0, f"{fam}: schedule not increasing and positive: {want}"
+            print(f"  {fam}: exact_merge={cfg.exact_merge} fast_lora={cfg.fast_lora} ckpt={cfg.ckpt} "
+                  f"screen_passes={getattr(cfg, 'screen_passes', '') or '-'}")
+    finally:
+        it.subprocess.Popen = orig_popen
+        if extra is not None:
+            os.environ["CROWN_EXTRA_ARGS"] = extra
+
+
 if __name__ == "__main__":
-    for name, fn in [("publish_exit0", publish_exit0), ("timeout_kill", timeout_kill), ("fallback_identity", fallback_identity), ("nothing_exit1", nothing_exit1)]:
+    for name, fn in [("recipes_parse", recipes_parse), ("publish_exit0", publish_exit0), ("timeout_kill", timeout_kill), ("fallback_identity", fallback_identity), ("nothing_exit1", nothing_exit1)]:
         check(name, fn)
     bad = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(bad)}/{len(RESULTS)} entrypoint checks passed")

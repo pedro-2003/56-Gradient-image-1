@@ -26,7 +26,7 @@ RECIPES = {
     "krea2":      ["--rank", "16", "--lr", "2e-4"],
     "ideogram4":  ["--rank", "16", "--lr", "2e-4", "--include", "layers[.][0-9]+[.](attention|adaln_modulation|feed_forward)", "--no-ckpt", "--train-base", "requant"],   # requant: measured -1.03% vs the dequantised base (2026-09-25, af4138aa), closes the gap to the champion   # block layers only: the evaluator re-quantises every patched tensor; the 7 embedder/final-layer tensors alone cost 0.7% (probe_requant 2026-09-24)   # twin released between scores -> fits: 0.68 s/step, peak 64.7 GB (smoke 2026-09-24); the OOM guard re-enables checkpointing if a task needs it
     "z-image":    ["--rank", "16", "--lr", "3e-4"],
-    "flux":       ["--rank", "16", "--lr", "3e-4"],
+    "flux":       ["--rank", "16", "--lr", "3e-4", "--exact-merge", "--fast-lora", "--no-ckpt", "--screen-passes", "0.5,1,1.5,2,2.5,3,3.5,4,5,6,8,10,12,16"],   # exact-merge: trains through the evaluator's stochastic fp8 re-rounding; on the fp8 modal base (MonochromeManga rehearsal 2026-09-26) -0.51 % vs without (paired SE 0.05 %), ties the champion (+0.04 %, SE 0.06 %); inert on bf16 bases (routes plain-fp8 Linears only)   # fast-lora + no-ckpt + screens on pass counts: G1 smoke 1.01 s/step, peak 53.5 GB; the OOM guard re-enables checkpointing if a task needs it
     "qwen-image": ["--rank", "8", "--lr", "1e-4", "--include", "transformer_blocks[.][0-9]+[.]attn[.](to_q|to_k|to_v|to_out)"],   # the public champion recipe's target set (240 vs 846 Linears): 1.47 -> ~1.05 s/step; Round 2 can be a qwen knockout
 }
 COMMON = ["--holdout-frac", "0.10", "--holdout-min", "3", "--eval-share", "0.15",
