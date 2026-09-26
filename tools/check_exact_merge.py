@@ -34,6 +34,12 @@ def main():
     from crown import comfy_boot
 
     comfy_boot.boot(a.comfy_root)
+    # --exact-merge rounds only when the evaluator GPU's noise is reproducible (crown.philox); install it here
+    from crown import contract as C
+    from crown.philox import install_evaluator_gpu
+
+    g = C.EVAL_GPU
+    print(install_evaluator_gpu(g["sm_count"], g["threads_per_sm"], g["fp8_compute"]), flush=True)
     import torch
 
     import comfy.float

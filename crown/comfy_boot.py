@@ -32,14 +32,10 @@ def boot(comfy_root=None, text_enc_dtype="fp16"):
     import comfy.model_management as mm
 
     mm.in_training = True
-    # the validator scores on its evaluation GPU (contract.EVAL_GPU: A100), not on the H100 we train on: its
-    # stochastic-rounding noise and its fp8 path are reproduced in-process (crown/philox.py), so the evaluator
-    # twin and --exact-merge compute what the validator computes
-    from . import contract as C
-    from .philox import install_evaluator_gpu
-
-    g = C.EVAL_GPU
-    _STATE["eval_gpu"] = install_evaluator_gpu(g["sm_count"], g["threads_per_sm"], g["fp8_compute"])
-    print(_STATE["eval_gpu"], flush=True)
+    # NOT installed in training: crown.philox.install_evaluator_gpu (the validator's A100 - no fp8 compute, so an
+    # fp8 flux base loads as bf16) was measured as a training setting by the pre-registered E3 arm (2026-09-26):
+    # D's flags on the A100's own bf16 model vs D on fp8 storage, both scored A100-style: +0.081 % (t +1.97),
+    # rejected by its rule (keep only if not worse than D by more than one SE). band_eval --eval-gpu a100 keeps
+    # the emulation as the measuring instrument.
     _STATE["mm"] = mm
     return mm

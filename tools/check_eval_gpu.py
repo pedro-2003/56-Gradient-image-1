@@ -25,6 +25,10 @@ def main():
     from crown import contract as C
 
     comfy_boot.boot(a.comfy_root)
+    from crown.philox import install_evaluator_gpu
+
+    g0 = C.EVAL_GPU
+    comfy_boot._STATE["eval_gpu"] = install_evaluator_gpu(g0["sm_count"], g0["threads_per_sm"], g0["fp8_compute"])   # the instrument (band_eval)
     import torch
 
     import comfy.float as cf
