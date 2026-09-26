@@ -83,9 +83,11 @@ class Selector:
 
     # --- 1-SE rule ------------------------------------------------------------------
     def pick(self, use_confirm=True) -> Optional[Candidate]:
-        """Among candidates whose paired difference to the best is within one SE,
-        return the earliest one. Earlier = less overfit direction, by the measured
-        monotone overfit curves; the rule never picks something significantly worse."""
+        """Among candidates whose paired difference to the best is within one SE, return the earliest
+        one OF THE BEST CANDIDATE'S OWN TRAJECTORY. Earlier = less overfit direction, by the measured
+        monotone overfit curves - which order the checkpoints of one member's run; a soup (member -1,
+        its step is the members' total) and another member (its own step count) are neither earlier nor
+        later than it, so they only win by score. The rule never picks something significantly worse."""
         pool = [c for c in self.cands if not c.unloadable and (c.confirm if use_confirm else c.screen) is not None]
         if not pool:
             return self.best()
@@ -95,6 +97,8 @@ class Selector:
         for c in pool:
             if c is b:
                 within.append(c); continue
+            if c.member != b.member:
+                continue
             mean, se, n = rep(c).paired_diff(rep(b))
             if n > 1 and mean <= se:      # c - b <= SE  → not distinguishably worse
                 within.append(c)

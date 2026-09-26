@@ -231,6 +231,28 @@ def selector_rules():
     assert c not in sel.top(3) and sel.best() is not c, "unloadable candidate still ranked"
 
 
+def selector_trajectory():
+    """The 1-SE 'earliest' preference orders the checkpoints of ONE member's run: a soup (member -1, step =
+    the members' total) or another member (its own step count) wins only by score (P1 z-image, 2026-09-26)."""
+    near = _rep([0.900, 0.901, 0.902, 0.903])          # within one SE of `best`, slightly worse
+    best = _rep([0.899, 0.900, 0.901, 0.902])
+    sel = Selector()
+    soup = Candidate("soup", 3271, {}, 1.0, screen=best, confirm=best, member=-1)
+    m1 = Candidate("raw", 1587, {}, 1.0, screen=near, confirm=near, member=1)
+    for x in (soup, m1):
+        sel.add(x)
+    p = sel.pick(use_confirm=True)
+    assert p is soup, f"picked {p.tag}@{p.step} (member {p.member}) over the better soup"
+    sel = Selector()
+    late = Candidate("ema", 1684, {}, 1.0, screen=best, confirm=best, member=0)
+    early = Candidate("ema", 1347, {}, 1.0, screen=near, confirm=near, member=0)
+    other = Candidate("raw", 900, {}, 1.0, screen=near, confirm=near, member=1)
+    for x in (late, early, other):
+        sel.add(x)
+    p = sel.pick(use_confirm=True)
+    assert p is early, f"picked {p.tag}@{p.step} (member {p.member}); expected the earlier point of the best's own run"
+
+
 def cadence_cap():
     tr, guider, extra, out, _ = build(seconds=25, adaptive_cadence=True)
     s = run(tr, guider, extra)
@@ -290,7 +312,7 @@ def seed2_fits_or_declines():
 
 if __name__ == "__main__":
     for name, fn in [("identity_first", identity_first), ("restore_on_error", restore_on_error), ("per_member_soup", per_member_soup),
-                     ("nonfinite_skip", nonfinite_skip), ("unloadable_veto", unloadable_veto), ("selector_rules", selector_rules),
+                     ("nonfinite_skip", nonfinite_skip), ("unloadable_veto", unloadable_veto), ("selector_rules", selector_rules), ("selector_trajectory", selector_trajectory),
                      ("cadence_cap", cadence_cap), ("trailing_ignores_0", trailing_ignores_0),
                      ("screen_passes_schedule", screen_passes_schedule), ("seed2_fits_or_declines", seed2_fits_or_declines)]:
         check(name, fn)
