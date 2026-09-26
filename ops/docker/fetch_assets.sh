@@ -1,32 +1,81 @@
 #!/usr/bin/env bash
-# Build-time asset pulls under a hard time budget. The validator cold-builds this image with
-# no cache under a 30-minute cap for EVERY task, so a slow mirror must never turn into a failed
-# build: files are fetched smallest first, each under its own timeout, the whole step under
-# ASSET_BUDGET_S, and a file that does not land is simply absent — the trainer degrades at run
-# time (no flux text encoders -> the task repo's own; no flux VAE -> the repo's diffusers VAE).
-# Exit status is always 0. The evaluator's ideogram4 base (8.7 GB) is no longer pulled: the twin
-# rebuilds it from the task cache (crown.twin.rebuild_ideogram4_evaluator_base; evaluator scores
-# within 0.058 % of the file on four LoRAs, same rank order, 2026-09-26).
+# Build-time asset pulls that can never cost the build.
+#
+# The validator cold-builds this image with no cache under a 30-minute cap for EVERY task (G.O.D
+# DOCKER_BUILD_TIMEOUT_MINUTES), and on docker 29's containerd image store every layer is gzip-compressed
+# when its step is committed. The asset layer's commit is the largest single cost of the whole build
+# (measured 2026-09-26 on the build VPS: 10.3 GB committed in ~17 min = 0.83 x that machine's single-core
+# `gzip -6` rate on the same kind of data). So before each file this script predicts when the build would
+# end with it:
+#     elapsed since the build's first RUN (/opt/crown/build_t0)
+#   + its download at the rate measured on the files before it
+#   + the commit of every byte of this layer at COMMIT_FACTOR x the gzip rate measured on a landed asset
+# and skips the file when that prediction passes the cap minus LEAD_S (the validator's clock starts before
+# our first RUN: FROM pull, context upload, ARG/ENV steps) and SAFETY_S (image export after the last commit,
+# error in the predictions). Each download is also cut at the latest moment that still leaves its commit
+# inside the cap. Files go smallest first; a skipped or failed file is simply absent and the trainer degrades
+# at run time (no flux text encoders -> the task repo's own; no flux VAE -> the repo's diffusers VAE).
+# The ideogram4 evaluator base is not pulled: the twin rebuilds it from the task cache
+# (crown.twin.rebuild_ideogram4_evaluator_base). Exit status is always 0.
 set -u
 DEST=${ASSET_DIR:-/opt/crown/assets}
-BUDGET=${ASSET_BUDGET_S:-540}
 REV=${FLUX_TE_REV:-6af2a98e3f615bdfa612fbd85da93d1ed5f69ef5}
+CAP_S=${BUILD_CAP_S:-1800}
+LEAD_S=60
+SAFETY_S=120
+COMMIT_FACTOR=0.8            # containerd's commit rate / `gzip -6` rate, 0.83 measured, rounded down
+PROBE_BYTES=64000000         # gzip-rate probe on the first landed asset
 mkdir -p "$DEST"
-start=$(date +%s)
+now() { date +%s; }
+t0=$(cat /opt/crown/build_t0 2>/dev/null || now)
+deadline=$(( t0 + CAP_S - LEAD_S - SAFETY_S ))
+layer=0                      # bytes of assets already in this layer
+dl_bytes=0; dl_ms=0          # download rate measurement
+commit_bps=0                 # predicted commit rate (bytes/s), 0 until measured
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+echo "asset step at t=$(( $(now) - t0 ))s since the first RUN; deadline t=$(( deadline - t0 ))s (cap ${CAP_S}s - ${LEAD_S}s - ${SAFETY_S}s)"
+
+remote_size() {  # the final Content-Length after redirects, empty if unknown
+  curl -sSIL --max-time 30 "$1" 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="content-length:"{n=$2} END{if (n != "") print n}'
+}
+
+probe_gzip() {  # single-core gzip -6 rate on the first PROBE_BYTES of a landed file -> commit_bps
+  local f=$1 s e ns
+  s=$(date +%s%N)
+  head -c "$PROBE_BYTES" "$f" | gzip -6 > /dev/null
+  e=$(date +%s%N)
+  ns=$(( e - s ))
+  [ "$ns" -gt 0 ] || return 0
+  commit_bps=$(awk -v b="$PROBE_BYTES" -v ns="$ns" -v k="$COMMIT_FACTOR" 'BEGIN{printf "%d", k * b / (ns / 1e9)}')
+  echo "gzip -6 probe: $(( PROBE_BYTES * 1000 / (ns / 1000000) / 1000000 )) MB/s -> predicted commit $(( commit_bps / 1000000 )) MB/s"
+}
+
 fetch() {  # name url
-  local name=$1 url=$2 left
-  left=$(( BUDGET - ($(date +%s) - start) ))
-  if [ "$left" -le 30 ]; then echo "asset budget exhausted; skipping $name"; return 0; fi
-  # -sS: no progress meter. The meter is '\r'-separated with no '\n' for minutes, and the validator's build-log
-  # reader (G.O.D core/logging.py stream_image_build_logs) buffers the stream until '\n' and rescans that
-  # buffer on every chunk; a 2026-09-24 cold build on the VPS wrote 4.6 GB of meter output. Errors still print.
+  local name=$1 url=$2 size t tm dl commit end left rc
+  size=$(remote_size "$url")
+  if [ -z "$size" ]; then echo "SKIPPED $name: size unknown (HEAD failed); trainer will degrade for this asset"; return 0; fi
+  t=$(now); tm=$(now_ms)
+  commit=0
+  [ "$commit_bps" -gt 0 ] && commit=$(( (layer + size) / commit_bps ))
+  dl=0
+  [ "$dl_bytes" -gt 0 ] && dl=$(( size * dl_ms / dl_bytes / 1000 ))
+  end=$(( t + dl + commit ))
+  if [ "$end" -gt "$deadline" ]; then
+    echo "SKIPPED $name ($(( size / 1000000 )) MB): predicted end t=$(( end - t0 ))s > deadline t=$(( deadline - t0 ))s (download ${dl}s + commit ${commit}s); trainer will degrade for this asset"
+    return 0
+  fi
+  left=$(( deadline - t - commit ))
+  if [ "$left" -le 10 ]; then echo "SKIPPED $name: no time left for its download"; return 0; fi
   if timeout "$left" curl -fsSL --retry 3 --retry-delay 2 -o "$DEST/$name.part" "$url"; then
     mv -f "$DEST/$name.part" "$DEST/$name"
-    echo "fetched $name ($(du -h "$DEST/$name" | cut -f1)) at t=$(( $(date +%s) - start ))s"
+    dl_bytes=$(( dl_bytes + size )); dl_ms=$(( dl_ms + $(now_ms) - tm ))
+    layer=$(( layer + size ))
+    [ "$commit_bps" -eq 0 ] && probe_gzip "$DEST/$name"
+    echo "fetched $name ($(( size / 1000000 )) MB) at t=$(( $(now) - t0 ))s"
   else
     rc=$?
     rm -f "$DEST/$name.part"
-    echo "MISSING $name (exit $rc) at t=$(( $(date +%s) - start ))s; trainer will degrade for this asset"
+    echo "MISSING $name (exit $rc) at t=$(( $(now) - t0 ))s; trainer will degrade for this asset"
   fi
   return 0
 }
@@ -35,5 +84,6 @@ fetch qwen_image_vae.safetensors       "https://huggingface.co/Comfy-Org/Krea-2/
 fetch flux2-vae.safetensors            "https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/vae/flux2-vae.safetensors"
 fetch ae.safetensors                   "https://huggingface.co/rayonlabs/FLUX.1-dev/resolve/main/ae.safetensors"
 fetch t5xxl_fp16.safetensors           "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/${REV}/t5xxl_fp16.safetensors"
-echo "assets present:"; ls -la --block-size=M "$DEST" | tail -n +2 | awk '{print $5, $9}'
+echo "assets present (predicted commit of this layer: $(( commit_bps > 0 ? layer / commit_bps : 0 ))s):"
+ls -la --block-size=M "$DEST" | tail -n +2 | awk '{print $5, $9}'
 exit 0

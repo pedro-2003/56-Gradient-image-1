@@ -12,13 +12,15 @@ FROM python:3.11-slim
 # pull is the last step. The image content is unchanged.
 ARG COMFYUI_COMMIT=694815f498295080a0e15a1502edc9dba841b110
 ARG FLUX_TE_REV=6af2a98e3f615bdfa612fbd85da93d1ed5f69ef5
-ARG ASSET_BUDGET_S=540
+ARG BUILD_CAP_S=1800
 ENV PYTHONUNBUFFERED=1 HF_HUB_DISABLE_PROGRESS_BARS=1 HF_HUB_OFFLINE=1 \
     COMFY_ROOT=/opt/ComfyUI PYTHONPATH=/app CROWN_ASSETS=/opt/crown/assets
 WORKDIR /app
 ENTRYPOINT ["python", "/app/scripts/image_trainer.py"]
 
-RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates \
+# build_t0: when the first RUN started - the asset step predicts the end of the build from it
+RUN mkdir -p /opt/crown && date +%s > /opt/crown/build_t0 \
+    && apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* && mkdir -p /app/checkpoints
 
 RUN git init /opt/ComfyUI && cd /opt/ComfyUI \
@@ -52,6 +54,8 @@ RUN pip install --timeout 120 --retries 3 --no-cache-dir -r /opt/ComfyUI/require
 # task cache's copy of the same weights (crown/twin.py) and uses it only to score candidates.
 # No dataset and no private artifact is bundled. Trained outputs derive solely from the
 # validator-provided base model and dataset.
-# The pulls run smallest-first under a hard time budget and NEVER fail the build: a missing file
+# The pulls run smallest-first and NEVER fail the build: before each file the script predicts the end of
+# the build (elapsed since build_t0 + the download at the measured rate + the gzip commit of this layer at
+# the measured rate) and skips the file if that passes the 30-minute cap minus a margin. A missing file
 # degrades the trainer at run time instead.
-RUN ASSET_BUDGET_S=${ASSET_BUDGET_S} FLUX_TE_REV=${FLUX_TE_REV} bash /opt/crown/fetch_assets.sh
+RUN BUILD_CAP_S=${BUILD_CAP_S} FLUX_TE_REV=${FLUX_TE_REV} bash /opt/crown/fetch_assets.sh
