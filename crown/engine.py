@@ -482,6 +482,21 @@ class Trainer:
                                  "per_band": self._per_band(rep), "per_image": rep.per_image, "wall_s": self.budget.elapsed()}
         self._dump()
         log("final:", json.dumps(self.summary["final"]))
+        # local analysis only - the variable is unset on the validator, and the directory is not the artifact's:
+        # every screened candidate's LoRA, so hidden images can score the alternatives the selector passed over
+        cdir = os.environ.get("CROWN_SAVE_CANDIDATES")
+        if cdir:
+            os.makedirs(cdir, exist_ok=True)
+            n = 0
+            for c in self.selector.cands:
+                if c.state is None or c.unloadable:
+                    continue
+                sc = c.confirm.score if c.confirm is not None else (c.screen.score if c.screen is not None else float("nan"))
+                save_lora(os.path.join(cdir, f"m{c.member}_{c.tag}_{c.step}.safetensors"), c.state, c.scale,
+                          metadata={"crown": f"m{c.member}:{c.tag}@{c.step}", "score": f"{sc:.6f}",
+                                    "picked": str(c is picked)})
+                n += 1
+            log(f"saved {n} candidates to {cdir}")
 
     def _per_band(self, rep):
         acc = {}
