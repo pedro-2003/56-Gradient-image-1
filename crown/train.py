@@ -70,10 +70,6 @@ def parse(argv=None):
     p.add_argument("--train-base", default="cache", choices=["cache", "evaluator", "requant"],
                    help="ideogram4: train on the cache's per-row fp8 base (dequantised) or on the evaluator's per-tensor file")
     p.add_argument("--flip", action="store_true", help="train on a horizontally flipped twin of every training image as well (architecture v6 L3)")
-    p.add_argument("--replan", action="store_true",
-                   help="after member 0's best step s* is known, train further members on ALL images for s* steps "
-                        "(annealed, blind) with the time left and ship the soup when member 0's curve is well-formed")
-    p.add_argument("--replan-max-members", type=int, default=3, help="at most this many blind members")
     p.add_argument("--screen-passes", default="", help="screen schedule in passes over the (image, band) cases, e.g. 0.5,1,1.5,2")
     p.add_argument("--screen-max-share", type=float, default=0.30, help="cap on the wall-clock share of screens under --screen-passes")
     p.add_argument("--seed2", action="store_true", help="after the plateau: a clean second seed for s* steps + soup (v7)")

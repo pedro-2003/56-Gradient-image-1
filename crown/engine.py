@@ -398,8 +398,6 @@ class Trainer:
                                             "best_member": m_best.member, "score": m_best.score, "plateau_exit": plateau_exit})
             # phase 2: the member returned early because its holdout plateaued and the
             # remaining budget can plausibly carry a fresh member to a comparable optimum
-            if getattr(cfg, "replan", False):
-                break                                   # the replan spends the rest on blind members
             if getattr(cfg, "seed2", False):
                 if plateau_exit:
                     self._seed2(guider, extra, m_best)
@@ -416,32 +414,14 @@ class Trainer:
             self._screen(guider, extra, sc)
             self.selector.add(sc)
 
-        # optimum-aware replan: with s* known, spend what is left on blind members trained on ALL
-        # images for s* steps and ship their soup with member 0's best (strategy v5 section 6)
-        replan_soup = None
-        if getattr(cfg, "replan", False):
-            replan_soup = self._replan(guider, extra, members)
-        if replan_soup is not None:
-            # the soup ships on the probe gate (see _replan); the confirm stage is only its loadability
-            # check through the twin (v6.1 M5/M6), the other candidates are not confirmed
-            if self.budget.fits(self.budget.est_eval(cfg.confirm_noises) * (1.5 if self.twin else 1.0)):
-                self._confirm(guider, extra, replan_soup)
-            if replan_soup.unloadable:
-                log("replan: soup NOT loadable by the evaluator; falling back to the 1-SE pick")
-                replan_soup = None
-
         # confirm the top candidates with more noise draws (the evaluator's own draws 0..k-1) —
         # through the evaluator twin where numerics differ — then 1-SE pick
-        top = [] if replan_soup is not None else self.selector.top(self._confirm_count())
+        top = self.selector.top(self._confirm_count())
         for c in top:
             if not self.budget.fits(self.budget.est_eval(cfg.confirm_noises) * (1.5 if self.twin else 1.0)):
                 break
             self._confirm(guider, extra, c)
         picked = self.selector.pick(use_confirm=any(c.confirm is not None for c in top)) or self.best
-        if replan_soup is not None:
-            base_pick = picked
-            picked = replan_soup
-            log(f"replan: shipping {replan_soup.tag} (blind members on all images) over {base_pick.tag}@{base_pick.step}")
         # never ship something the evaluator cannot load: check the final state on the evaluator's own
         # loader path (the twin's base where numerics differ, else the training model)
         ok, missing = self._final_loadable(picked.state, picked.scale)
@@ -518,15 +498,7 @@ class Trainer:
                     log(f"m0 plateau at step {step} (best {mb.tag}@{mb.step}); seed2 for {mb.step} steps fits ({need_s2:.0f}s of {budget.remaining():.0f}s)")
                     break
             if plateau and want_phase2 and not getattr(cfg, "seed2", False):
-                if getattr(cfg, "replan", False):
-                    # v6.3: with --replan the rest of the budget goes to blind members, so the exit is gated on
-                    # ONE blind member (s* scaled to all images) plus the replan's own reserve, not on a phase-2 member
-                    steps_all = math.ceil(max(1, mb.step) * len(self.items) / max(1, len(self.train_items)))
-                    need_next = steps_all * budget.est_step() + budget.est_eval(cfg.confirm_noises) + 2 * budget.est_eval() + 60
-                    if not self._well_formed(mb):
-                        need_next = float("inf")       # v7: the replan would skip -> never exit into dead time
-                else:
-                    need_next = max(1, mb.step) * budget.est_step() + 3 * budget.est_eval() + budget.est_eval(cfg.confirm_noises) * cfg.confirm_top
+                need_next = max(1, mb.step) * budget.est_step() + 3 * budget.est_eval() + budget.est_eval(cfg.confirm_noises) * cfg.confirm_top
                 if budget.fits(need_next):
                     plateau_exit = True
                     log(f"m{member} plateau at step {step} (best {mb.tag}@{mb.step}); handing {budget.remaining():.0f}s to the next member")
@@ -688,8 +660,8 @@ class Trainer:
         log(f"seed2: member-0 best {m0.screen.score if m0.screen else float('nan'):.6f}, seed2 {c1.score:.6f}, soup {soup.score:.6f}")
 
     def _well_formed(self, m0):
-        """Member 0's curve supports a blind replan: a confirmed-interior optimum (a later screened
-        point exists and is worse than the best by more than the paired SE) at a non-trivial step."""
+        """Member 0's curve supports a blind second seed (--seed2): a confirmed-interior optimum (a later
+        screened point exists and is worse than the best by more than the paired SE) at a non-trivial step."""
         if m0.member != 0 or m0.step < 50 or m0.screen is None:
             return False
         later = [c for c in self.selector.cands if c.member == 0 and c.screen is not None and c.step > m0.step]
@@ -702,77 +674,16 @@ class Trainer:
                 worse += 1
         return worse >= 1
 
-    def _replan(self, guider, extra, members):
-        cfg, budget = self.cfg, self.budget
-        m0 = members[0]
-        if not self._well_formed(m0):
-            log("replan: member 0's curve is not well-formed (no confirmed interior optimum); skipped")
-            self.summary["replan"] = {"skipped": "not well-formed"}
-            return None
-        n_all, n_train = len(self.items), len(self.train_items)
-        steps = int(math.ceil(m0.step * n_all / n_train))
-        reserve = budget.est_eval(cfg.confirm_noises) + budget.est_eval() * 2 + 60   # one soup confirm + probe/soup screens (v6.2)
-        per_member = steps * budget.est_step() + 10
-        k = int((budget.remaining() - reserve) // per_member)
-        k = max(0, min(int(getattr(cfg, "replan_max_members", 3)), k))
-        if k < 1:
-            log(f"replan: no room for a blind member ({steps} steps = {per_member:.0f}s, {budget.remaining():.0f}s left)")
-            self.summary["replan"] = {"skipped": "no room", "steps": steps, "left_s": budget.remaining()}
-            return None
-        log(f"replan: s*={m0.step} -> {steps} steps on all {n_all} images x {k} blind members ({per_member:.0f}s each, {budget.remaining():.0f}s left)")
-        states = [m.state for m in members]          # every holdout-selected best, then the blind ones
-        # gate (v6.1 M5): the first blind member trains on the TRAINING images only, so its holdout screen
-        # is uncontaminated; if the blind recipe at s* does not reproduce member 0's quality (worse by more
-        # than the paired SE) the replan is abandoned before any contaminated member is trained
-        self.lora.reinit(cfg.seed + 1000 * 100)
-        st = self._train_fixed(guider, extra, 100, m0.step, items=self.train_items)
-        if st is None or not budget.fits(budget.est_eval() + reserve):
-            self.summary["replan"] = {"skipped": "probe did not finish", "steps": m0.step}
-            return None
-        probe = Candidate("blind-probe", self.summary["steps"], st, self.lora.scale, member=100)
-        self._screen(guider, extra, probe)
-        self.selector.add(probe)
-        mean, se, n = probe.screen.paired_diff(m0.screen)
-        if n > 1 and mean > se:
-            log(f"replan: blind probe {probe.score:.6f} vs member-0 best {m0.screen.score:.6f} (+{mean:.5f} > SE {se:.5f}): recipe not reproduced; skipped")
-            self.summary["replan"] = {"skipped": "probe worse than member 0", "probe": probe.score, "m0": m0.screen.score}
-            return None
-        log(f"replan: blind probe {probe.score:.6f} vs member-0 best {m0.screen.score:.6f} within SE: recipe reproduced, training on all images")
-        states.append(st)
-        for j in range(1, k):
-            member = 100 + j                     # blind members are numbered from 100
-            if not budget.fits(per_member + reserve):
-                break
-            self.lora.reinit(cfg.seed + 1000 * member)
-            st = self._train_fixed(guider, extra, member, steps)
-            if st is None:
-                break
-            states.append(st)
-        if len(states) < 2:
-            self.summary["replan"] = {"skipped": "no member finished", "steps": steps}
-            return None
-        soup = Candidate("replan-soup", self.summary["steps"], soup_state(states), self.lora.scale, member=-2)
-        # sanity screen on the holdout (contaminated for the blind members, so optimistic): a soup that
-        # still regresses against member 0's best is broken and must not ship
-        self._screen(guider, extra, soup)
-        self.selector.add(soup)
-        mean, se, n = soup.screen.paired_diff(m0.screen)
-        ok = not (n > 1 and mean > se)
-        self.summary["replan"] = {"s_star": m0.step, "steps": steps, "members": len(states) - 1, "soup_screen": soup.score,
-                                  "m0_screen": m0.screen.score, "ship": ok}
-        log(f"replan: soup of {len(states)} states screens {soup.score:.6f} vs member-0 best {m0.screen.score:.6f} -> {'ship' if ok else 'REJECTED'}")
-        return soup if ok else None
-
     def _train_fixed(self, guider, extra, member, steps, items=None, reserve=None):
-        """Blind member: exactly `steps` steps on `items` (default ALL images), cosine annealed over
-        those steps, EMA state returned; no screens. Stops early (returns None) only on the budget or a
-        second OOM."""
+        """Blind member: exactly `steps` steps on `items` (default: the training images, never the
+        holdout), cosine annealed over those steps, EMA state returned; no screens. Stops early (returns
+        None) only on the budget or a second OOM."""
         cfg, lora, budget = self.cfg, self.lora, self.budget
         groups = [{"params": lora.up_params, "lr_mult": cfg.lora_plus_ratio}, {"params": lora.down_params, "lr_mult": 1.0}]
         opt = torch.optim.AdamW(groups, lr=cfg.lr, betas=(0.9, 0.99), weight_decay=cfg.weight_decay, eps=1e-8)
         ema = [p.detach().clone() for p in lora.params] if cfg.ema > 0 else None
         gen = torch.Generator(device="cpu").manual_seed(cfg.seed + 7919 * member)
-        items = items if items is not None else self.items
+        items = items if items is not None else self.train_items
         cases = []
         step = 0
         t_start = time.time()

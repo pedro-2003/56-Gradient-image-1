@@ -64,8 +64,7 @@ def build(seconds=40, n_images=12, max_members=1, twin=True, **over):
         lr=3e-3, lr_final_frac=0.1, warmup_steps=5, weight_decay=0.0, grad_clip=1.0, lora_plus_ratio=1.0, ema=0.99,
         eval_share=0.25, confirm_top=3, confirm_noises=4, phase2=True, max_members=max_members,
         polish=False, polish_lr_frac=0.3, band_power=0.0, plateau_window=2, screen_ema_only=False,
-        empty_prompt_frac=0.5, select_metric="mean", eval_every=0, holdout_names="", replan=False, replan_max_members=3,
-        init_lora="", flip=False, adaptive_cadence=False)
+        empty_prompt_frac=0.5, select_metric="mean", eval_every=0, holdout_names="", flip=False, adaptive_cadence=False)
     for k, v in over.items():
         setattr(cfg, k, v)
     out = tempfile.mkdtemp(prefix="crown-check-")
@@ -272,30 +271,28 @@ def screen_passes_schedule():
 
 
 def seed2_fits_or_declines():
-    """--seed2 (virtual clock, measured profiles): runs where the arithmetic allows, declines cleanly where not."""
+    """--seed2 (virtual clock, measured profiles) over independent simulator draws: it never starts a second
+    seed that cannot finish, never breaks the 2-minute margin, and opens on boss z-image where the arithmetic
+    allows it in at least one draw. (Whether it opens in a given draw depends on when the noisy plateau is
+    detected: 5 of 10 draws on boss z-image, 2026-09-26; a single-draw assertion was a coin flip.)"""
     sim = _sim()
     pol = {"name": "t", "screen_passes": sim.SCHED, "seed2": True}
-    r_fit = sim.Sim("z-image", 1.0, 32, 4, pol).run()
-    assert r_fit["seed2"] and not r_fit["seed2"].get("skipped"), f"seed2 did not run on boss z-image: {r_fit['seed2']}"
-    r_no = sim.Sim("krea2", 0.75, 20, 3, pol).run()
-    assert not r_no["seed2"] or r_no["seed2"].get("skipped") is None, f"unexpected seed2 state {r_no['seed2']}"
-    for r in (r_fit, r_no):
-        assert r["slack_min"] >= 2.0, f"{r['family']}: ends {r['slack_min']} min before the deadline (margin broken)"
-
-
-def replan_no_dead_time():
-    """--replan never exits member 0 into a replan that then declines (the 17-20 min dead-time defect)."""
-    sim = _sim()
-    r = sim.Sim("ideogram4", 1.0, 30, 4, {"name": "t", "replan": True}).run()
-    assert r["slack_min"] < 9.0, f"run ended {r['slack_min']} min early (dead time)"
+    opened = 0
+    for fam, h, ntr, nho, seeds in (("z-image", 1.0, 32, 4, range(5)), ("krea2", 0.75, 20, 3, range(3))):
+        for seed in seeds:
+            r = sim.Sim(fam, h, ntr, nho, pol, seed=seed).run()
+            s2 = r["seed2"]
+            assert not (s2 and s2.get("skipped")), f"{fam} draw {seed}: seed2 started but did not finish: {s2}"
+            assert r["slack_min"] >= 2.0, f"{fam} draw {seed}: ends {r['slack_min']} min before the deadline (margin broken)"
+            opened += 1 if (s2 and fam == "z-image") else 0
+    assert opened >= 1, "seed2 never opened on boss z-image in 5 draws although the arithmetic allows it"
 
 
 if __name__ == "__main__":
     for name, fn in [("identity_first", identity_first), ("restore_on_error", restore_on_error), ("per_member_soup", per_member_soup),
                      ("nonfinite_skip", nonfinite_skip), ("unloadable_veto", unloadable_veto), ("selector_rules", selector_rules),
                      ("cadence_cap", cadence_cap), ("trailing_ignores_0", trailing_ignores_0),
-                     ("screen_passes_schedule", screen_passes_schedule), ("seed2_fits_or_declines", seed2_fits_or_declines),
-                     ("replan_no_dead_time", replan_no_dead_time)]:
+                     ("screen_passes_schedule", screen_passes_schedule), ("seed2_fits_or_declines", seed2_fits_or_declines)]:
         check(name, fn)
     bad = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(bad)}/{len(RESULTS)} checks passed")

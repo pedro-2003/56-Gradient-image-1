@@ -1,8 +1,8 @@
 """Budget / time-policy simulator: the REAL crown engine on a virtual clock (no GPU).
 
-Why: three GPU runs were spent learning that a replan could not fit (flux plateau declared at 27 min,
+Why: three GPU runs were spent learning that a time policy could not fit (flux plateau declared at 27 min,
 krea2 exit gate, krea2 arithmetic). Every timing decision the engine makes — screen cadence, plateau
-exit, second member, replan fit, confirm count, final slack before the deadline — depends only on
+exit, second member, seed2 fit, confirm count, final slack before the deadline — depends only on
 measured costs and the shape of the holdout curve. This harness runs the actual engine code with:
   * a virtual clock (crown.engine.time / crown.budget.time patched) advanced by the MEASURED step time
     per optimiser step, the measured screen cost per holdout image per noise, the measured load time;
@@ -12,7 +12,7 @@ measured costs and the shape of the holdout curve. This harness runs the actual 
 It reports the timeline, what the engine chose, the regret of the shipped pick against the curve's true
 minimum, and the slack left before the validator's clock.
 
-    python tools/sim_budget.py --family flux --hours 0.75 --n-train 24 --n-holdout 3 [--replan] [--adaptive-cadence]
+    python tools/sim_budget.py --family flux --hours 0.75 --n-train 24 --n-holdout 3 [--policy v7-passes+seed2]
     python tools/sim_budget.py --grid                       # every family x regime x policy -> table
 """
 import argparse
@@ -24,6 +24,7 @@ import random
 import sys
 import tempfile
 import types
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -59,7 +60,6 @@ PROFILES = {
 }
 RAW_PENALTY = 0.12     # raw screens sit this many % points above the EMA at the same step (measured median)
 SOUP_GAIN = 0.30       # a soup of two distinct members: % points below the better member (flux 2026-09-25: -0.32%)
-REPLAN_OPTIMISM = 0.40  # contaminated holdout screen of a replan soup (blind members saw the holdout images)
 TWIN_RELOAD_S = 20.0   # twin: base build + release + training-model reload per call
 VERIFY_S = 8.0         # final loadability check
 
@@ -99,7 +99,7 @@ class Sim:
     def __init__(self, family, hours, n_train, n_holdout, policy, seed=0, case_noise=1.0, profile_override=None):
         self.p = dict(PROFILES[family], **(profile_override or {}))
         self.family, self.hours, self.n_train, self.n_holdout = family, hours, n_train, n_holdout
-        self.policy, self.rng = policy, random.Random(seed)
+        self.policy, self.rng, self.seed = policy, random.Random(seed), seed
         self.case_noise = case_noise
         self.clock = VClock()
         self.current = None                # candidate being scored (set by the wrapped _screen/_confirm)
@@ -115,10 +115,6 @@ class Sim:
         if member == -1:                                   # phase-2 soup of distinct member bests
             bests = [v for k, v in self.member_best.items() if 0 <= k < 100]
             return (min(bests) if bests else 0.0) - SOUP_GAIN
-        if member == -2:                                   # replan soup
-            return self.member_best.get(0, 0.0) - SOUP_GAIN
-        if member >= 100:                                  # blind member / probe: reproduces member 0's optimum
-            return self.member_best.get(0, 0.0)
         passes = step / self.pass_steps
         r = curve_at(self.p, passes)
         base_tag = tag.replace("pol-", "")
@@ -128,13 +124,15 @@ class Sim:
             r += RAW_PENALTY / 2
         return r
 
-    def report(self, cand, noises, contaminated=False):
+    def report(self, cand, noises):
         r = self.true_r(cand)
         if cand.member >= 0 and cand.tag not in ("identity", "base"):
             self.member_best[cand.member] = min(self.member_best.get(cand.member, 0.0), r)
-        seen = r - (REPLAN_OPTIMISM if contaminated else 0.0)
+        seen = r
         per_case, per_image, text, notext = {}, [], [], []
-        rng = random.Random(hash((cand.tag, cand.member, cand.step, noises)) & 0xffffffff)
+        # stable seed: Python's str hash is randomised per process (PYTHONHASHSEED), which made every
+        # simulator number a single irreproducible draw (found 2026-09-26)
+        rng = random.Random(zlib.crc32(f"{self.seed}|{cand.tag}|{cand.member}|{cand.step}|{noises}".encode()))
         for i in range(self.n_holdout):
             img_f = 0.8 + 0.4 * ((i * 7919) % 97) / 97.0     # fixed image difficulty
             vals = {"text": [], "no_text": []}
@@ -164,8 +162,7 @@ class Sim:
 
         def fake_score(sself, model_wrap, extra_args, set_cond, noises=1, noise_offset=0):
             sim.clock.sleep(sim.p["img_s"] * sim.n_holdout * noises)
-            contaminated = sim.current is not None and sim.current.member == -2   # blind members saw the holdout
-            return sim.report(sim.current, noises, contaminated)
+            return sim.report(sim.current, noises)
         scoring.HoldoutScorer.score = fake_score
         engine.HoldoutScorer.score = fake_score
 
@@ -195,7 +192,7 @@ class Sim:
 
             def score(self, state, scale, noises=1):
                 sim.clock.sleep(sim.p["img_s"] * sim.n_holdout * noises * 0.5 + TWIN_RELOAD_S)
-                return sim.report(sim.current, noises, sim.current is not None and sim.current.member == -2), []
+                return sim.report(sim.current, noises), []
 
         orig_verify = engine.verify_loadable
 
@@ -223,8 +220,7 @@ class Sim:
                 max_members=pol.get("max_members", 2), polish=False, polish_lr_frac=0.3, band_power=0.0,
                 plateau_window=pol.get("plateau_window", 3), screen_ema_only=pol.get("screen_ema_only", False),
                 empty_prompt_frac=0.5, select_metric="mean", eval_every=pol.get("eval_every", 0), holdout_names="",
-                replan=pol.get("replan", False), replan_max_members=3, init_lora="", flip=False,
-                adaptive_cadence=pol.get("adaptive_cadence", False), oracle_train_all=False, twin=self.p["twin"],
+                flip=False, adaptive_cadence=pol.get("adaptive_cadence", False), twin=self.p["twin"],
                 screen_passes=pol.get("screen_passes", ""), screen_max_share=pol.get("screen_max_share", 0.3), seed2=pol.get("seed2", False))
             deadline = self.clock.t + self.hours * 3600.0
             self.t_start = self.clock.t
@@ -249,7 +245,7 @@ class Sim:
             "family": self.family, "hours": self.hours, "n_train": self.n_train, "policy": self.policy.get("name", "?"),
             "pick": f"{fin.get('picked')}@{fin.get('step')} m{fin.get('member')}", "true_r_pick": round(r_pick, 3), "true_min": round(rmin, 3),
             "regret": round(r_pick - rmin, 3), "members": [(m["member"], m["best_step"], m["plateau_exit"]) for m in s.get("members", [])],
-            "replan": s.get("replan"), "seed2": s.get("seed2"), "screens": sum(1 for e in self.events if e[1] == "screen"), "confirms": sum(1 for e in self.events if e[1] == "confirm"),
+            "seed2": s.get("seed2"), "screens": sum(1 for e in self.events if e[1] == "screen"), "confirms": sum(1 for e in self.events if e[1] == "confirm"),
             "m0_exit_min": next((round(e[0], 1) for e in self.events if e[1] == "screen" and e[2] == 1), None),
             "end_min": round(end_min, 1), "slack_min": round(self.hours * 60 - end_min, 1), "steps": s["steps"],
         }
@@ -261,7 +257,6 @@ class Sim:
 SCHED = "0.5,1,1.5,2,2.5,3,3.5,4,5,6,8,10,12,16"
 POLICIES = {
     "v6.3":            {"name": "v6.3"},
-    "v6.3+replan":     {"name": "v6.3+replan", "replan": True},
     "v6.3+adaptive":   {"name": "v6.3+adaptive", "adaptive_cadence": True},
     "v7-passes":       {"name": "v7-passes", "screen_passes": SCHED},
     "v7-passes+seed2": {"name": "v7-passes+seed2", "screen_passes": SCHED, "seed2": True},
@@ -292,12 +287,11 @@ def main():
                 print(f"  {e[0]:6.1f} min  {e[1]:8} m{e[2]} step {e[3]} {e[4]:12} true {e[5]:+.3f}")
         print(json.dumps(r, indent=1))
         return
-    print(f"{'regime':6} {'family':10} {'h':>4} {'ntr':>3} {'policy':14} {'pick':24} {'r_pick':>7} {'r_min':>7} {'regret':>6} {'scr':>3} {'cnf':>3} {'m1@':>5} {'end':>5} {'slack':>5}  members / replan")
+    print(f"{'regime':6} {'family':10} {'h':>4} {'ntr':>3} {'policy':14} {'pick':24} {'r_pick':>7} {'r_min':>7} {'regret':>6} {'scr':>3} {'cnf':>3} {'m1@':>5} {'end':>5} {'slack':>5}  members / seed2")
     for fam, h, ntr, nho, label in REGIMES:
         for pname, pol in POLICIES.items():
             r = Sim(fam, h, ntr, nho, pol).run()
-            rp = r["replan"] or {}
-            rps = ("replan " + (rp.get("skipped") or f"k={rp.get('members')} ship={rp.get('ship')}")) if pol.get("replan") else ""
+            rps = ""
             if pol.get("seed2"):
                 s2 = r.get("seed2") or {}
                 rps = "seed2 " + (s2.get("skipped") or ("ran" if s2 else "no exit"))
