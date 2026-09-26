@@ -234,8 +234,9 @@ def selector_rules():
 def selector_trajectory():
     """The 1-SE 'earliest' preference orders the checkpoints of ONE member's run: a soup (member -1, step =
     the members' total) or another member (its own step count) wins only by score (P1 z-image, 2026-09-26)."""
-    near = _rep([0.900, 0.901, 0.902, 0.903])          # within one SE of `best`, slightly worse
     best = _rep([0.899, 0.900, 0.901, 0.902])
+    near = _rep([0.899, 0.902, 0.900, 0.903])          # paired diffs 0, +.002, -.001, +.001: mean .0005 <= SE .00065
+    assert near.paired_diff(best)[0] <= near.paired_diff(best)[1], "test data: `near` must lie within one SE of `best`"
     sel = Selector()
     soup = Candidate("soup", 3271, {}, 1.0, screen=best, confirm=best, member=-1)
     m1 = Candidate("raw", 1587, {}, 1.0, screen=near, confirm=near, member=1)
