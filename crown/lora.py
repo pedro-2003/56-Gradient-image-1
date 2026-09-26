@@ -40,7 +40,7 @@ class LoraWrapper:
             # the evaluator merges in fp16 on sm80+ (lora_compute_dtype) and casts back (v6.1 F4)
             merged = w.to(torch.float16) + delta.reshape(w.shape).to(torch.float16)
             if self.fp8_dtype is not None:
-                return _evaluator_fp8_round(merged, self.fp8_dtype, self.seed, w.dtype)
+                return _evaluator_fp8_round(merged, self.fp8_dtype, self.seed, w.dtype, self)
             return merged.to(w.dtype)
         return (w.float() + delta.reshape(w.shape)).to(w.dtype)
 
@@ -48,17 +48,69 @@ class LoraWrapper:
         return self
 
 
-def _evaluator_fp8_round(merged16, fp8_dtype, seed, out_dtype):
+def _sr_e4m3_math(x, rng):
+    """comfy_kitchen's eager stochastic_rounding_fp8 (e4m3), expression for expression - the backend Comfy uses
+    on a cu128 torch (quant_ops disables the ck cuda backend below cu130), hence the evaluator's own numbers.
+    Every step is exact in fp16 for these inputs (power-of-two scalings, 3 mantissa bits + an 8-bit random
+    offset), so one fused kernel computing the same expressions returns the same bits."""
+    x = x.half()
+    sign = torch.sign(x)
+    abs_x = x.abs()
+    sign = torch.where(abs_x == 0, 0, sign)
+    exponent = torch.clamp(torch.floor(torch.log2(abs_x)) + 7, 0, 15)
+    normal = ~(exponent == 0)
+    m = torch.where(normal, (abs_x / (2.0 ** (exponent - 7)) - 1.0) * 8, abs_x / (2.0 ** (-7 + 1 - 3)))
+    m = m + rng.to(dtype=m.dtype) * (1.0 / 256.0)
+    abs_x = m.floor() / 8
+    out = sign * torch.where(normal, (2.0 ** (exponent - 7)) * (1.0 + abs_x), (2.0 ** (-7 + 1)) * abs_x)
+    return torch.clamp(out, min=-448.0, max=448.0).to(torch.float8_e4m3fn)
+
+
+_SR_FUSED = {"fn": None, "ok": None}   # compiled kernel; ok: None = unverified, True/False after the self-check
+
+
+def _sr_rounded(merged16, fp8_dtype, seed, wrapper):
+    """The evaluator's rounding of one merged weight. On CUDA for e4m3: the fused kernel on this module's cached
+    rng (torch.randint with the evaluator's generator seed - fixed per key), verified bitwise against
+    comfy.float.stochastic_rounding on first use and abandoned for good on any mismatch (fail closed).
+    Elsewhere: comfy.float.stochastic_rounding itself."""
+    import comfy.float
+
+    x = merged16.detach()
+    if fp8_dtype == torch.float8_e4m3fn and x.is_cuda and _SR_FUSED["ok"] is not False:
+        rng = getattr(wrapper, "_rng", None)
+        if rng is None or rng.shape != x.shape or rng.device != x.device:
+            g = torch.Generator(device=x.device)
+            g.manual_seed(seed)
+            rng = torch.randint(0, 256, x.size(), dtype=torch.uint8, layout=x.layout, device=x.device, generator=g)
+            wrapper._rng = rng
+        try:
+            if _SR_FUSED["fn"] is None:
+                torch._inductor.config.emulate_precision_casts = True
+                _SR_FUSED["fn"] = torch.compile(_sr_e4m3_math, dynamic=True)
+            q = _SR_FUSED["fn"](x, rng)
+            if _SR_FUSED["ok"] is None:
+                ref = comfy.float.stochastic_rounding(x, fp8_dtype, seed=seed)
+                _SR_FUSED["ok"] = bool(torch.equal(q.view(torch.uint8), ref.view(torch.uint8)))
+                print(f"exact-merge fused rounding self-check: {'bitwise equal' if _SR_FUSED['ok'] else 'MISMATCH -> exact slow path'}", flush=True)
+                if not _SR_FUSED["ok"]:
+                    return ref
+            return q
+        except Exception as e:  # noqa: BLE001 - any compile/runtime failure falls back to the evaluator's own call
+            _SR_FUSED["ok"] = False
+            print(f"exact-merge fused rounding unavailable ({type(e).__name__}: {e}); exact slow path", flush=True)
+    return comfy.float.stochastic_rounding(x, fp8_dtype, seed=seed)
+
+
+def _evaluator_fp8_round(merged16, fp8_dtype, seed, out_dtype, wrapper=None):
     """The evaluator's last merge step for a plain-fp8 weight (ModelPatcher.patch_weight_to_device, no
     set_weight on manual_cast/fp8_ops Linears): comfy.float.stochastic_rounding(merged fp16, fp8, seed =
     string_to_seed(key)); Comfy's manual cast then upcasts it exactly for compute. The value returned is
     exactly that rounded weight - what the evaluator will score - and the gradient passes straight through
     the fp16 merge: q + (y - y.detach()) has value q (y - y is exactly zero) and derivative 1 in y."""
-    import comfy.float
-
     y = merged16.to(out_dtype)
     with torch.no_grad():
-        q = comfy.float.stochastic_rounding(merged16.detach(), fp8_dtype, seed=seed).to(out_dtype)
+        q = _sr_rounded(merged16, fp8_dtype, seed, wrapper).to(out_dtype)
     return q + (y - y.detach())
 
 
