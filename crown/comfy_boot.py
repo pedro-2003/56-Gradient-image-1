@@ -32,5 +32,14 @@ def boot(comfy_root=None, text_enc_dtype="fp16"):
     import comfy.model_management as mm
 
     mm.in_training = True
+    # the validator scores on its evaluation GPU (contract.EVAL_GPU: A100), not on the H100 we train on: its
+    # stochastic-rounding noise and its fp8 path are reproduced in-process (crown/philox.py), so the evaluator
+    # twin and --exact-merge compute what the validator computes
+    from . import contract as C
+    from .philox import install_evaluator_gpu
+
+    g = C.EVAL_GPU
+    _STATE["eval_gpu"] = install_evaluator_gpu(g["sm_count"], g["threads_per_sm"], g["fp8_compute"])
+    print(_STATE["eval_gpu"], flush=True)
     _STATE["mm"] = mm
     return mm

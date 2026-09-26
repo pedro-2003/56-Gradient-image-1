@@ -47,9 +47,12 @@ def philox4x32_10(c0, c1, c2, c3, k0, k1):
     return c0, c1, c2, c3
 
 
-def randint_u8(shape, seed, sm_count, device, threads_per_sm=2048, chunk_threads=1 << 22):
+def randint_u8(shape, seed, sm_count, device, threads_per_sm=2048, max_pairs=1 << 24):
     """torch.randint(0, 256, shape, dtype=torch.uint8) from a fresh generator seeded with `seed`, as drawn on a CUDA
-    device with `sm_count` SMs and `threads_per_sm` resident threads per SM (torch 2.9.1 kernel geometry)."""
+    device with `sm_count` SMs and `threads_per_sm` resident threads per SM (torch 2.9.1 kernel geometry).
+    Draw d of thread t fills elements t + T*(4d + i), i = 0..3, so the flat output in element order is the
+    (draw, word, thread) grid flattened; draws are processed in chunks of at most `max_pairs` (draw, thread)
+    pairs to bound memory."""
     n = 1
     for s in shape:
         n *= int(s)
@@ -62,20 +65,18 @@ def randint_u8(shape, seed, sm_count, device, threads_per_sm=2048, chunk_threads
     draws = (n - 1) // (T * 4) + 1
     k0 = torch.tensor(seed & MASK, dtype=torch.int64, device=device)
     k1 = torch.tensor((seed >> 32) & MASK, dtype=torch.int64, device=device)
-    zero = torch.zeros((), dtype=torch.int64, device=device)
-    for t0 in range(0, T, chunk_threads):
-        t1 = min(T, t0 + chunk_threads)
-        tids = torch.arange(t0, t1, dtype=torch.int64, device=device)          # subsequence = thread index
-        for d in range(draws):
-            c0 = torch.full_like(tids, d)
-            words = philox4x32_10(c0, zero.expand_as(tids), tids, zero.expand_as(tids), k0, k1)
-            for i, w in enumerate(words):
-                li = tids + T * (4 * d + i)
-                keep = li < n
-                if bool(keep.all()):
-                    out[li] = (w & 0xFF).to(torch.uint8)
-                elif bool(keep.any()):
-                    out[li[keep]] = (w[keep] & 0xFF).to(torch.uint8)
+    tids = torch.arange(T, dtype=torch.int64, device=device).unsqueeze(0)      # subsequence = thread index
+    step = max(1, max_pairs // T)
+    for d0 in range(0, draws, step):
+        d1 = min(draws, d0 + step)
+        c0 = torch.arange(d0, d1, dtype=torch.int64, device=device).unsqueeze(1).expand(d1 - d0, T)
+        c2 = tids.expand(d1 - d0, T)
+        z = torch.zeros_like(c0)
+        words = philox4x32_10(c0, z, c2, z, k0, k1)
+        flat = torch.stack(words, dim=1).reshape(-1)                            # (draw, word, thread) order
+        start = d0 * 4 * T
+        m = min(n - start, flat.numel())
+        out[start:start + m] = (flat[:m] & 0xFF).to(torch.uint8)
     return out.reshape(shape)
 
 
@@ -86,10 +87,20 @@ def install_evaluator_gpu(sm_count, threads_per_sm=2048, fp8_compute=False):
         re-quantisation (comfy_quant: quant_ops) both call it by attribute, so both follow;
       - comfy.model_management.supports_fp8_compute reports that GPU's answer (sm80: False), so comfy_quant
         layers take the emulated path (dequantised weights, bf16 activations) as they do on the evaluator.
-    Idempotent. Returns a one-line description for the log."""
+    The noise patch is installed only after self_check() reproduces THIS device's own torch.randint bit for bit
+    (fail closed: a PyTorch build with another kernel geometry keeps Comfy's own draws, and
+    comfy.float._crown_eval_sm_count stays unset so --exact-merge does not round against a pattern it cannot
+    reproduce). Idempotent. Returns a one-line description for the log."""
     import comfy.float as cf
     import comfy.model_management as mm
 
+    mm.supports_fp8_compute = lambda device=None: fp8_compute
+    if getattr(cf, "_crown_eval_sm_count", None) == sm_count:
+        return f"evaluator GPU emulated (already): {sm_count} SMs, fp8 compute {fp8_compute}"
+    if torch.cuda.is_available():
+        ok, msg = self_check(torch.device("cuda"), shapes=((1000,), (300_001,), (3072, 3072)), seeds=(0, 3287197034))
+        if not ok:
+            return f"evaluator GPU NOT emulated: philox self-check failed ({msg}); fp8 compute {fp8_compute}"
     orig = getattr(cf, "_crown_orig_stochastic_rounding", None) or cf.stochastic_rounding
     cf._crown_orig_stochastic_rounding = orig
 
@@ -102,7 +113,7 @@ def install_evaluator_gpu(sm_count, threads_per_sm=2048, fp8_compute=False):
 
     cf.stochastic_rounding = stochastic_rounding
     cf._crown_eval_sm_count = sm_count
-    mm.supports_fp8_compute = lambda device=None: fp8_compute
+    cf._crown_eval_threads_per_sm = threads_per_sm
     return f"evaluator GPU emulated: stochastic-rounding noise with {sm_count} SMs x {threads_per_sm} threads, fp8 compute {fp8_compute}"
 
 

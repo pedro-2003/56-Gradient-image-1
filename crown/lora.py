@@ -71,18 +71,21 @@ _SR_FUSED = {"fn": None, "ok": None}   # compiled kernel; ok: None = unverified,
 
 def _sr_rounded(merged16, fp8_dtype, seed, wrapper):
     """The evaluator's rounding of one merged weight. On CUDA for e4m3: the fused kernel on this module's cached
-    rng (torch.randint with the evaluator's generator seed - fixed per key), verified bitwise against
-    comfy.float.stochastic_rounding on first use and abandoned for good on any mismatch (fail closed).
+    rng - the noise torch.randint draws for the evaluator's generator seed (fixed per key) ON THE EVALUATOR'S GPU
+    (crown.philox.randint_u8 with contract.EVAL_GPU's geometry: an A100 draws a different pattern than the H100
+    we train on) - verified bitwise against comfy.float.stochastic_rounding (patched the same way by
+    crown.philox.install_evaluator_gpu) on first use and abandoned for good on any mismatch (fail closed).
     Elsewhere: comfy.float.stochastic_rounding itself."""
     import comfy.float
+
+    from .philox import randint_u8
 
     x = merged16.detach()
     if fp8_dtype == torch.float8_e4m3fn and x.is_cuda and _SR_FUSED["ok"] is not False:
         rng = getattr(wrapper, "_rng", None)
         if rng is None or rng.shape != x.shape or rng.device != x.device:
-            g = torch.Generator(device=x.device)
-            g.manual_seed(seed)
-            rng = torch.randint(0, 256, x.size(), dtype=torch.uint8, layout=x.layout, device=x.device, generator=g)
+            rng = randint_u8(tuple(x.size()), int(seed), comfy.float._crown_eval_sm_count, x.device,
+                             comfy.float._crown_eval_threads_per_sm)
             wrapper._rng = rng
         try:
             if _SR_FUSED["fn"] is None:
@@ -107,8 +110,18 @@ def _evaluator_fp8_round(merged16, fp8_dtype, seed, out_dtype, wrapper=None):
     set_weight on manual_cast/fp8_ops Linears): comfy.float.stochastic_rounding(merged fp16, fp8, seed =
     string_to_seed(key)); Comfy's manual cast then upcasts it exactly for compute. The value returned is
     exactly that rounded weight - what the evaluator will score - and the gradient passes straight through
-    the fp16 merge: q + (y - y.detach()) has value q (y - y is exactly zero) and derivative 1 in y."""
+    the fp16 merge: q + (y - y.detach()) has value q (y - y is exactly zero) and derivative 1 in y.
+    Fail closed: when the evaluator GPU's noise could not be reproduced here (crown.philox.install_evaluator_gpu
+    refused: comfy.float._crown_eval_sm_count unset), the merge is NOT rounded - a pattern that is not the
+    evaluator's is noise the LoRA would fit to no purpose (0.97 % of an A100 draw agrees with an H100 draw)."""
+    import comfy.float
+
     y = merged16.to(out_dtype)
+    if getattr(comfy.float, "_crown_eval_sm_count", None) is None:
+        if not getattr(_evaluator_fp8_round, "_warned", False):
+            _evaluator_fp8_round._warned = True
+            print("exact-merge: the evaluator GPU's rounding noise is not reproducible here -> merge NOT rounded", flush=True)
+        return y
     with torch.no_grad():
         q = _sr_rounded(merged16, fp8_dtype, seed, wrapper).to(out_dtype)
     return q + (y - y.detach())
