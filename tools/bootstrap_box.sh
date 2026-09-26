@@ -7,7 +7,8 @@
 #   IMAGE          docker image tag; pulled if it exists in a registry, else built here  (default crown-image-trainer)
 #   REGISTRY       optional registry prefix, e.g. ghcr.io/<user>  -> pulls $REGISTRY/$IMAGE
 #   CACHE_DIR      where /cache is staged                                               (default $HOME/cache)
-#   R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET   if set, models come from the R2 mirror (tools/r2.sh)
+#   R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET   if set, the tournament dataset zips come from R2
+#                  (models always come from the Hugging Face Hub; R2 does not mirror public files)
 #   HF_TOKEN       needed for gated repos (krea/Krea-2-Raw, FLUX) when pulling from HuggingFace
 #   DATASETS_DIR   local research/datasets copy (task dirs with NNN.png/NNN.txt/task.json)
 #
@@ -37,15 +38,17 @@ else
 fi
 
 echo "== 2. cache ($CACHE_DIR)"; mkdir -p "$CACHE_DIR"/{models,datasets,hf_cache}
+# Models always come from the Hugging Face Hub: R2 no longer mirrors public files (2026-09-26, owner's order;
+# measured on the H100, HF was never slower than R2). R2 keeps only the tournament dataset zips, which exist
+# nowhere else once the API's links expire.
 if [ -n "${R2_ACCESS_KEY_ID:-}" ] && command -v rclone >/dev/null; then
-  bash "$HERE/tools/r2.sh" setup >/dev/null && bash "$HERE/tools/r2.sh" pull "$CACHE_DIR" "${FAMILIES[@]}"
-else
-  pip show huggingface_hub >/dev/null 2>&1 || pip install -q huggingface_hub
-  for fam in "${FAMILIES[@]}"; do
-    d=$(ls -d "$DATASETS_DIR"/*_"$fam" 2>/dev/null | head -1); [ -n "$d" ] || { echo "no local dataset for $fam"; continue; }
-    python "$HERE/tools/prepare_cache.py" --cache "$CACHE_DIR" --task-dir "$d" --model "${BASE[$fam]}" --model-type "$fam"
-  done
+  bash "$HERE/tools/r2.sh" setup >/dev/null && bash "$HERE/tools/r2.sh" pull-tree cache/datasets "$CACHE_DIR/datasets" || true
 fi
+pip show huggingface_hub >/dev/null 2>&1 || pip install -q huggingface_hub
+for fam in "${FAMILIES[@]}"; do
+  d=$(ls -d "$DATASETS_DIR"/*_"$fam" 2>/dev/null | head -1); [ -n "$d" ] || { echo "no local dataset for $fam"; continue; }
+  python "$HERE/tools/prepare_cache.py" --cache "$CACHE_DIR" --task-dir "$d" --model "${BASE[$fam]}" --model-type "$fam"
+done
 
 echo "== 3. dataset zips for every local task dir"
 for d in "$DATASETS_DIR"/*/; do [ -f "$d/task.json" ] || continue
